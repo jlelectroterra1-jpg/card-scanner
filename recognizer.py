@@ -11,10 +11,16 @@ NAME_BOX = (0.04, 0.025, 0.80, 0.105)
 FOOTER_LINES = [(0.04, 0.925, 0.45, 0.958), (0.04, 0.944, 0.45, 0.977)]
 
 
+# Picture match counts as sure when the best card's score leads the next card by this much
+# (calibrated with tests/test_visual.py).
+VIS_GAP = 0.20
+
+
 class Recognizer:
-    def __init__(self, db):
+    def __init__(self, db, visual_index=None):
         self.db = db
         self.ocr = RapidOCR(params={"Global.log_level": "error"})
+        self.visual = visual_index
 
     # ---- geometry -------------------------------------------------------
 
@@ -39,6 +45,10 @@ class Recognizer:
         c = max(contours, key=cv2.contourArea)
         if cv2.contourArea(c) < 0.12 * w * h:
             return None
+        if background_bgr is not None and cv2.contourArea(c) > 0.85 * w * h:
+            # Nearly the whole box "changed": the light changed, not just a card
+            # arriving. Find the card by its edges instead.
+            return Recognizer.find_card(zone_bgr, None)
         box = order_corners(cv2.boxPoints(cv2.minAreaRect(c)))
         tl, tr, br, bl = box
         if np.linalg.norm(tr - tl) > np.linalg.norm(bl - tl):  # lying sideways -> make it portrait
@@ -62,7 +72,7 @@ class Recognizer:
 
     def identify(self, card_bgr, locked_set=None):
         """Returns dict(name_text, footer_text, candidates=[(name, score)],
-        printings=[most likely first], confident, card=straightened image)."""
+        printings=[most likely first], confident, card=straightened image, how)."""
         best = None
         # Cards can land upside down; try both ways and keep whichever reads better.
         for img in (card_bgr, cv2.rotate(card_bgr, cv2.ROTATE_180)):
@@ -73,7 +83,21 @@ class Recognizer:
                 best = dict(img=img, name_text=text, candidates=cands, top=top)
             if top >= 90:
                 break
-        if best["top"] < 80:
+        name_sure = best["top"] >= 97 or (best["top"] >= 85 and best["top"] - second_score(best["candidates"]) >= 8)
+
+        # Recognise the picture: works when the card is too small or blurry to read.
+        vis = []
+        if self.visual is not None and not (name_sure and best["top"] >= 97):
+            vis = self.visual.query(best["img"], k=5)
+            if best["top"] < 90:  # name unreadable, so we don't know which way up it is
+                flipped = self.visual.query(cv2.rotate(best["img"], cv2.ROTATE_180), k=5)
+                if flipped and flipped[0][2] > vis[0][2]:
+                    vis = flipped
+                    best["img"] = cv2.rotate(best["img"], cv2.ROTATE_180)
+        vis_gap = (vis[0][2] - vis[1][2]) if len(vis) > 1 else 0
+        vis_sure = bool(vis) and vis_gap >= VIS_GAP
+
+        if best["top"] < 80 and not vis_sure:
             # Showcase / borderless / split frames put the name somewhere else,
             # so read everything on the card and see if any line is a card name.
             for img in (best["img"], cv2.rotate(best["img"], cv2.ROTATE_180)):
@@ -84,18 +108,40 @@ class Recognizer:
                         best = dict(img=img, name_text=line, candidates=cands, top=cands[0][1])
                 if best["top"] >= 90:
                     break
-        if not best["candidates"]:
-            return dict(name_text=best["name_text"], footer_text="", candidates=[], printings=[], confident=False, card=best["img"])
+            name_sure = best["top"] >= 97 or (best["top"] >= 85 and best["top"] - second_score(best["candidates"]) >= 8)
+
+        candidates, confident, how = best["candidates"], name_sure, "name"
+        if vis:
+            v_name = vis[0][0]
+            v_names = [v[0] for v in vis]
+            n_top = candidates[0][0] if candidates else None
+            if n_top and n_top == v_name and best["top"] >= 60:
+                confident, how = True, "name+picture"  # both agree
+            elif not name_sure and vis_sure:
+                candidates, confident, how = [(v_name, 100.0)] + [c for c in candidates if c[0] != v_name], True, "picture"
+            elif not name_sure:
+                # Not sure either way: offer the best guesses from both, agreeing ones first.
+                merged = {}
+                for n, sc in candidates:
+                    merged[n] = sc + (20 if n in v_names else 0)
+                for rank, (n, _, _) in enumerate(vis):
+                    merged[n] = max(merged.get(n, 0), 90 - 8 * rank)
+                candidates = sorted(merged.items(), key=lambda t: -t[1])[:5]
+
+        if not candidates:
+            return dict(name_text=best["name_text"], footer_text="", candidates=[], printings=[], confident=False,
+                        card=best["img"], how="none")
+        name = candidates[0][0]
         footer = " ".join(self.read_line(best["img"], b, height=40) for b in FOOTER_LINES)
-        name = best["candidates"][0][0]
-        second = best["candidates"][1][1] if len(best["candidates"]) > 1 else 0
-        # An exact read is trusted even when a similar name exists (Lightning Bolt / Lightning Colt).
-        confident = best["top"] >= 97 or (best["top"] >= 85 and best["top"] - second >= 8)
         return dict(
-            name_text=best["name_text"], footer_text=footer, candidates=best["candidates"],
+            name_text=best["name_text"], footer_text=footer, candidates=candidates,
             printings=self.db.ranked_printings(name, footer, locked_set, best["img"]),
-            confident=confident, card=best["img"],
+            confident=confident, card=best["img"], how=how,
         )
+
+
+def second_score(cands):
+    return cands[1][1] if len(cands) > 1 else 0
 
 
 def order_corners(pts):

@@ -21,6 +21,7 @@ import numpy as np
 from carddb import CardDB
 from printmatch import IMG_DIR
 from recognizer import Recognizer
+from visual import INDEX_PATH as VISUAL_INDEX
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(HERE, "data", "settings.json")
@@ -31,7 +32,7 @@ VIEW_W, VIEW_H = 960, 540  # camera preview size on screen
 PANEL_W = 420
 WIN = "Card Scanner"
 UP_KEY, DOWN_KEY = 0x260000, 0x280000  # arrow keys from cv2.waitKeyEx on Windows
-MIN_ZONE_H = 330  # scan box smaller than this (camera pixels) = card too small to read
+MIN_ZONE_H = 200  # scan box smaller than this (camera pixels) = card too small to recognise
 
 # Scan trigger tuning (on a 96-px-wide grey thumbnail of the scan zone).
 PRESENT_FRAC = 0.20   # this share of the zone must differ from the empty desk
@@ -93,7 +94,14 @@ class Scanner:
         print("Loading card database...")
         self.db = CardDB()
         print("Loading text reader...")
-        self.rec = Recognizer(self.db)
+        vis = None
+        if os.path.exists(VISUAL_INDEX):
+            print("Loading picture recognition...")
+            from visual import VisualIndex
+            vis = VisualIndex()
+        else:
+            print("No picture index yet (run build_visual_index.py) - reading names only.")
+        self.rec = Recognizer(self.db, vis)
         self.settings = load_json(SETTINGS_PATH, {})
         if args.camera is not None:
             self.settings["camera"] = args.camera

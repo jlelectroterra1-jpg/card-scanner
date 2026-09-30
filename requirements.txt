@@ -4,3 +4,4 @@ rapidfuzz
 requests
 rapidocr
 onnxruntime
+onnx

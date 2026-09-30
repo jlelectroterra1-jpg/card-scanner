@@ -9,3 +9,4 @@ web/_test/
 __pycache__/
 *.part
 .claude/
+tests/exp_cache.pkl

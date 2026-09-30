@@ -4,7 +4,8 @@ A free, unlimited webcam scanner for Magic: The Gathering cards. It runs entirel
 your PC using Scryfall's free card data, so there are no accounts and no scan limits.
 
 ## Start
-Double-click **Start Scanner.bat**. The first run downloads the card list (about 80 MB, 30 s).
+Double-click **Start Scanner.bat**. The first run downloads the card list (about 80 MB, 30 s)
+and a small picture of every card artwork for picture recognition (about 500 MB, 15-30 min, once).
 Double-click **Update Prices.bat** now and then for fresh prices and new sets.
 
 ## Scanning
@@ -47,10 +48,15 @@ Prices are Scryfall's USD market prices.
 - `update_db.py` downloads Scryfall's bulk card data into `data/cards.db`.
 - `recognizer.py` finds the card in the box, straightens it, and reads the name bar (RapidOCR).
 - `carddb.py` fuzzy-matches the name against all ~34,000 cards.
+- `visual.py` recognises the card by its picture when the name is too small or blurry to
+  read: a MobileNetV2 fingerprint shortlists the 100 closest of ~45,000 artworks, then a
+  colour-thumbnail comparison (ignoring glare/fingers) picks the match. Built by
+  `build_visual_index.py`.
 - `printmatch.py` compares the photo with Scryfall's image of every printing to pick the
   exact one (images are cached in `data/img`).
 
-Tests: `python tests/test_synthetic.py 100` (recognition accuracy) and
+Tests: `python tests/test_synthetic.py 100` (name reading), `python tests/test_visual.py 200`
+(picture recognition of small, blurry cards) and
 `python tests/test_scanner_smoke.py` (auto-scan loop).
 
 ## Phone version (web/)
