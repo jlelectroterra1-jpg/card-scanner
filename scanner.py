@@ -30,6 +30,8 @@ EXPORT_DIR = os.path.join(HERE, "exports")
 VIEW_W, VIEW_H = 960, 540  # camera preview size on screen
 PANEL_W = 420
 WIN = "Card Scanner"
+UP_KEY, DOWN_KEY = 0x260000, 0x280000  # arrow keys from cv2.waitKeyEx on Windows
+MIN_ZONE_H = 330  # scan box smaller than this (camera pixels) = card too small to read
 
 # Scan trigger tuning (on a 96-px-wide grey thumbnail of the scan zone).
 PRESENT_FRAC = 0.20   # this share of the zone must differ from the empty desk
@@ -39,7 +41,7 @@ STILL_FRAMES = 6      # ~0.2 s at 30 fps
 
 GREEN, YELLOW, RED, WHITE, GREY = (80, 200, 80), (0, 210, 255), (60, 60, 230), (240, 240, 240), (150, 150, 150)
 KEYS_HELP = [
-    "drag = scan zone   B = empty-desk photo   SPACE = scan now",
+    "drag = scan zone   B = empty-desk photo   SPACE = scan now   S = add by name",
     "F = foil   G = foil by default   [ ] = printing   DEL = remove last   L = lock set",
     "E = export   C = camera   N = new list   Q = quit",
 ]
@@ -108,6 +110,7 @@ class Scanner:
         self.last_scanned_small = None
         self.busy = False
         self.review = None  # recognition result waiting for the user to choose
+        self.typing = None  # {"kind": "search" | "lock", "text", "matches", "sel"} while typing in the window
         self.status, self.status_color = "", WHITE
         self.results = queue.Queue()
         self.last_frame = None
@@ -208,13 +211,16 @@ class Scanner:
         if res["confident"] and res["printings"]:
             self.add_card(res["printings"], res["card"])
             beep(True)
-        else:
+        elif res["candidates"]:
             self.review = res
             beep(False)
-            if res["candidates"]:
-                self.set_status("Not sure - pick 1-5, or X to skip", YELLOW)
+            self.set_status("Not sure - pick 1-5, S to type the name, X to skip", YELLOW)
+        else:
+            beep(False)
+            if self.zone and self.zone[3] - self.zone[1] < MIN_ZONE_H:
+                self.set_status("Couldn't read it - the card is too small in the picture. Move the camera closer.", RED)
             else:
-                self.set_status(f"Couldn't read a name ({res['name_text'][:20]!r}) - reposition, SPACE to retry", RED)
+                self.set_status("Couldn't read the name - SPACE to retry, S to type it", RED)
 
     def choose_candidate(self, i):
         res = self.review
@@ -348,6 +354,20 @@ class Scanner:
         put(canvas, f"camera {self.cam_index}" + (f"   set locked: {lock.upper()}" if lock else "")
             + ("   default: FOIL" if self.settings.get("default_finish") == "foil" else ""), (x, 52), GREY, 0.45)
 
+        if self.typing is not None:
+            t = self.typing
+            put(canvas, "Type the card name:" if t["kind"] == "search" else "Set code to lock (empty = any set):",
+                (x, 90), YELLOW, 0.6)
+            put(canvas, t["text"] + "_", (x, 124), WHITE, 0.7)
+            for i, name in enumerate(t["matches"]):
+                sel = i == t["sel"]
+                put(canvas, ("> " if sel else "  ") + ascii_text(name)[:34], (x, 160 + i * 26), GREEN if sel else WHITE, 0.55)
+            put(canvas, "ENTER = ok   ESC = cancel" + ("   up/down = choose" if t["kind"] == "search" else ""),
+                (x, 300), GREY, 0.45)
+            if self.review is not None:
+                canvas[320:530, x:x + 150] = cv2.resize(self.review["card"], (150, 210))
+            return
+
         if self.review is not None:
             put(canvas, "Which card is it?", (x, 90), YELLOW, 0.65)
             for i, (name, score) in enumerate(self.review["candidates"][:5]):
@@ -405,9 +425,15 @@ class Scanner:
                 self.prev_small = None
                 if self.last_frame is not None:
                     self.capture_background(self.last_frame)
-                    self.set_status("Box set & empty desk saved (press B again if a card was in it)", GREEN)
+                    if y1 - y0 < MIN_ZONE_H:
+                        self.set_status("Box is small: move the camera closer so the card looks bigger", YELLOW)
+                    else:
+                        self.set_status("Box set & empty desk saved (press B again if a card was in it)", GREEN)
 
     def on_key(self, key):
+        if self.typing is not None:
+            self.on_typing_key(key)
+            return True
         if key in (ord("q"), 27):
             return False
         ch = chr(key).lower() if 0 <= key < 256 else ""
@@ -418,7 +444,7 @@ class Scanner:
                 self.review = None
                 self.set_status("Skipped", GREY)
             elif ch == "s":
-                self.search_prompt()
+                self.start_typing("search")
             elif key == 13 and self.review["candidates"]:
                 self.choose_candidate(0)
             return True
@@ -443,7 +469,9 @@ class Scanner:
             self.open_camera((self.cam_index + 1) % 5)
             save_json(SETTINGS_PATH, self.settings)
         elif ch == "l":
-            self.lock_set_prompt()
+            self.start_typing("lock", self.settings.get("locked_set") or "")
+        elif ch == "s":
+            self.start_typing("search")
         elif ch == "g":
             foil = self.settings.get("default_finish") == "foil"
             self.settings["default_finish"] = "nonfoil" if foil else "foil"
@@ -461,28 +489,56 @@ class Scanner:
                 self.set_status("Press N again to export and start a new list", YELLOW)
         return True
 
-    def lock_set_prompt(self):
-        self.set_status("Type the set code in the terminal window...", YELLOW)
-        self.refresh()
-        code = input("Set code to lock (e.g. MKM), or Enter to unlock: ").strip().lower()
-        if code and code not in self.db.set_codes:
-            print(f"  Unknown set code '{code}'")
-            self.set_status(f"Unknown set '{code}'", RED)
-            return
-        self.settings["locked_set"] = code or None
-        save_json(SETTINGS_PATH, self.settings)
-        self.set_status(f"Locked to {code.upper()}" if code else "Set unlocked", GREEN)
+    # Typing happens in the scanner window itself (never the terminal, which would
+    # freeze the window while it waits).
+    def start_typing(self, kind, text=""):
+        self.typing = dict(kind=kind, text=text, matches=[], sel=0)
+        self.set_status("Type the card name, then ENTER" if kind == "search" else "Type a set code, then ENTER", YELLOW)
 
-    def search_prompt(self):
-        self.set_status("Type the card name in the terminal window...", YELLOW)
-        self.refresh()
-        text = input("Card name: ").strip()
-        names = self.db.search(text, 5) if text else []
-        if not names:
-            self.set_status("No match - try again (S)", RED)
+    def on_typing_key(self, key):
+        t = self.typing
+        if key == 27:
+            self.typing = None
+            self.set_status("Cancelled", GREY)
             return
-        self.review["candidates"] = [(n, 100.0) for n in names]
-        self.set_status("Pick 1-5", YELLOW)
+        if key == 13:
+            self.finish_typing()
+            return
+        if key == UP_KEY:
+            t["sel"] = max(0, t["sel"] - 1)
+        elif key == DOWN_KEY:
+            t["sel"] = min(max(0, len(t["matches"]) - 1), t["sel"] + 1)
+        elif key == 8:
+            t["text"] = t["text"][:-1]
+        elif 32 <= key < 127:
+            t["text"] += chr(key)
+        else:
+            return
+        if t["kind"] == "search" and key not in (UP_KEY, DOWN_KEY):
+            t["matches"] = self.db.search(t["text"], 5) if len(t["text"].strip()) >= 2 else []
+            t["sel"] = 0
+
+    def finish_typing(self):
+        t, self.typing = self.typing, None
+        if t["kind"] == "lock":
+            code = t["text"].strip().lower()
+            if code and code not in self.db.set_codes:
+                self.set_status(f"Unknown set code '{code}' - press L to try again", RED)
+                return
+            self.settings["locked_set"] = code or None
+            save_json(SETTINGS_PATH, self.settings)
+            self.set_status(f"Locked to {code.upper()}" if code else "Set unlocked", GREEN)
+            return
+        if not t["matches"]:
+            self.set_status("No card by that name - press S to try again", RED)
+            return
+        name = t["matches"][t["sel"]]
+        card_img = self.review["card"] if self.review is not None else None
+        prints = self.db.ranked_printings(name, "", self.settings.get("locked_set"), card_img)
+        self.review = None
+        if prints:
+            self.add_card(prints, card_img)
+            beep(True)
 
     def refresh(self):
         if self.last_frame is not None:
