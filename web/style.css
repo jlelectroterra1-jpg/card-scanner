@@ -70,7 +70,9 @@ a { color: var(--accent); }
   display: flex; align-items: flex-start; justify-content: center;
 }
 #guide span { margin-top: -30px; font-size: 13px; color: #fffc; text-shadow: 0 1px 3px #000; white-space: nowrap; }
-#guide.busy { border-color: var(--warn); }
+#guide.looking { animation: looking 1.6s ease-in-out infinite; }
+@keyframes looking { 50% { border-color: #fff5; } }
+#guide.busy { border-color: var(--warn); animation: none; }
 #guide.ok { border-color: var(--accent); }
 #guide.bad { border-color: var(--danger); }
 .status {

@@ -6,10 +6,10 @@ const ORT_WASM = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
 const CARD_RATIO = 63 / 88;
 
 // Auto-scan tuning (on a 32x44 grey thumbnail of the guide box).
-const SAMPLE_MS = 180;
-const STILL_LEVEL = 7;    // mean pixel change between samples below this = holding still
-const STILL_SAMPLES = 3;  // ~0.5 s
-const REARM_FRAC = 0.30;  // this much of the box must change before the next card is scanned
+const SAMPLE_MS = 150;
+const STILL_LEVEL = 11;   // mean pixel change between samples below this = steady enough (hand-held is fine)
+const STILL_SAMPLES = 2;  // ~0.3 s
+const REARM_FRAC = 0.30;  // after a card is added, this much of the box must change before the next one
 
 const $ = id => document.getElementById(id);
 const store = {
@@ -23,6 +23,7 @@ const state = {
   settings: Object.assign({ lockSet: "", defaultFoil: false, sound: true, auto: true }, store.get("settings", {})),
   busy: false,
   review: null,
+  unsure: 0,
   armed: true,
   prevThumb: null,
   lastScanThumb: null,
@@ -186,9 +187,12 @@ function sample() {
   if (state.prevThumb) state.still = meanDiff(t, state.prevThumb) < STILL_LEVEL ? state.still + 1 : 0;
   state.prevThumb = t;
   if (!state.armed && state.lastScanThumb && fracDiff(t, state.lastScanThumb) > REARM_FRAC) state.armed = true;
+  // Keep trying while something is in view; only a successful scan (or a
+  // "which card?" question) pauses until the picture changes.
   if (state.settings.auto && state.armed && state.still >= STILL_SAMPLES && !state.busy && !state.review && modalsClosed()) {
     scanNow(true);
   }
+  $("guide").classList.toggle("looking", state.settings.auto && state.armed && !state.busy);
 }
 
 const modalsClosed = () => ["review", "list", "settings"].every(id => $(id).classList.contains("hidden"));
@@ -198,8 +202,7 @@ const modalsClosed = () => ["review", "list", "settings"].every(id => $(id).clas
 async function scanNow(auto = false) {
   if (state.busy || !state.ready) return;
   state.busy = true;
-  state.armed = false;
-  state.lastScanThumb = state.prevThumb || thumb();
+  const seen = state.prevThumb || thumb();
   setGuide("busy");
   try {
     const card = findCard(grabGuide());
@@ -209,7 +212,12 @@ async function scanNow(auto = false) {
       setGuide("");
       return;
     }
-    await identify(card, auto);
+    const outcome = await identify(card, auto);
+    if (outcome !== "retry") {
+      // Added, or asked the user: don't scan this same card again until the view changes.
+      state.armed = false;
+      state.lastScanThumb = seen;
+    }
   } catch (e) {
     console.error(e);
     status(`Error: ${e.message}`, "bad");
@@ -243,13 +251,19 @@ async function identify(card, auto) {
     else status("");
     setGuide("");
     if (!auto) beep(false);
-    return;
+    return "retry";
   }
   if (res.confident) {
+    state.unsure = 0;
     await addByName(res.candidates[0][0], res.card);
-  } else {
-    openReview(res);
+    return "added";
   }
+  // In auto mode a shaky or half-in-view frame often reads badly; try a few more
+  // frames before bothering the user with a question.
+  if (auto && ++state.unsure < 3) { status(""); setGuide(""); return "retry"; }
+  state.unsure = 0;
+  openReview(res);
+  return "asked";
 }
 
 async function addByName(name, cardCanvas) {
@@ -516,7 +530,7 @@ function saveSettings() { store.set("settings", state.settings); }
 $("start-btn").onclick = startCamera;
 $("photo-start").onchange = e => { unlockAudio(); scanPhoto(e.target.files[0]); e.target.value = ""; };
 $("photo-input").onchange = e => { scanPhoto(e.target.files[0]); e.target.value = ""; };
-$("scan-btn").onclick = () => { state.armed = true; scanNow(false); };
+$("scan-btn").onclick = () => { state.armed = true; state.unsure = 3; scanNow(false); };
 $("search-btn").onclick = () => openReview({ candidates: [], card: document.createElement("canvas"), text: "" });
 $("prev-print").onclick = () => cyclePrinting(-1);
 $("next-print").onclick = () => cyclePrinting(1);
