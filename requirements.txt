@@ -1,0 +1,6 @@
+opencv-python
+numpy
+rapidfuzz
+requests
+rapidocr
+onnxruntime

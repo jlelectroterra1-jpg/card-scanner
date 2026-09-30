@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#111214">
+  <title>Card Scanner</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="icon" href="icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Start / loading screen -->
+  <section id="start" class="screen">
+    <div class="start-inner">
+      <img src="icon-192.png" alt="" class="logo">
+      <h1>Card Scanner</h1>
+      <p class="muted">Scan Magic cards with your camera. Free, no limits, nothing leaves your phone except Scryfall look-ups.</p>
+      <div id="load-progress" class="progress"><div></div></div>
+      <p id="load-text" class="muted small">Loading…</p>
+      <button id="start-btn" class="primary big" disabled>Start camera</button>
+      <label class="linkish">or scan a photo <input id="photo-start" type="file" accept="image/*" hidden></label>
+    </div>
+  </section>
+
+  <!-- Scanner -->
+  <section id="scan" class="screen hidden">
+    <header class="topbar">
+      <button id="list-btn" class="pill"><span id="count">0</span> cards · <span id="total">$0.00</span></button>
+      <div class="top-right">
+        <label class="pill toggle"><input id="auto-toggle" type="checkbox" checked> Auto</label>
+        <button id="settings-btn" class="pill" aria-label="Settings">⚙︎</button>
+      </div>
+    </header>
+    <div id="viewport">
+      <video id="video" playsinline muted autoplay></video>
+      <div id="guide"><span>Fill this box with the card</span></div>
+      <div id="status" class="status"></div>
+    </div>
+    <div id="last" class="sheet hidden">
+      <img id="last-img" alt="">
+      <div class="last-info">
+        <div id="last-name" class="name"></div>
+        <div id="last-set" class="muted small"></div>
+        <div class="row">
+          <span id="last-price" class="price"></span>
+          <span id="last-finish" class="tag"></span>
+        </div>
+        <div class="row buttons">
+          <button id="prev-print" aria-label="Previous printing">◀</button>
+          <span id="print-idx" class="muted small"></span>
+          <button id="next-print" aria-label="Next printing">▶</button>
+          <button id="foil-btn">Foil</button>
+          <button id="undo-btn" class="danger">Remove</button>
+        </div>
+      </div>
+    </div>
+    <footer class="controls">
+      <label class="round small-round" aria-label="Scan a photo">🖼<input id="photo-input" type="file" accept="image/*" hidden></label>
+      <button id="scan-btn" class="round shutter" aria-label="Scan now"></button>
+      <button id="search-btn" class="round small-round" aria-label="Add by name">⌕</button>
+    </footer>
+  </section>
+
+  <!-- Review: not sure which card -->
+  <section id="review" class="modal hidden">
+    <div class="modal-card">
+      <h2>Which card is it?</h2>
+      <div class="review-body">
+        <canvas id="review-img" width="126" height="176"></canvas>
+        <div id="review-list" class="choice-list"></div>
+      </div>
+      <input id="review-search" type="search" placeholder="Type the name…" autocomplete="off" autocapitalize="words">
+      <div class="row buttons end"><button id="review-skip">Skip</button></div>
+    </div>
+  </section>
+
+  <!-- Collection list -->
+  <section id="list" class="modal hidden">
+    <div class="modal-card tall">
+      <div class="row spread">
+        <h2><span id="list-count">0</span> cards · <span id="list-total">$0.00</span></h2>
+        <button id="list-close" class="pill">Done</button>
+      </div>
+      <div class="row buttons">
+        <button id="export-csv" class="primary">ManaBox CSV</button>
+        <button id="export-text">Copy list</button>
+        <button id="clear-list" class="danger">Clear</button>
+      </div>
+      <p class="muted small">CSV has Scryfall IDs for exact ManaBox imports. “Copy list” gives <code>1 Name (SET) 123 *F*</code> lines for Moxfield, Archidekt and others.</p>
+      <ul id="list-items" class="items"></ul>
+    </div>
+  </section>
+
+  <!-- Settings -->
+  <section id="settings" class="modal hidden">
+    <div class="modal-card">
+      <div class="row spread"><h2>Settings</h2><button id="settings-close" class="pill">Done</button></div>
+      <label class="field">Lock to set (code, e.g. MKM)
+        <input id="lock-set" type="text" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="any set">
+      </label>
+      <label class="field inline"><input id="default-foil" type="checkbox"> New cards are foil</label>
+      <label class="field inline"><input id="sound-on" type="checkbox" checked> Beep on scan</label>
+      <p class="muted small">Tips: good even light, no glare. Hold the phone 15–20 cm above the card so it fills the box. With Auto on, it scans when the card holds still; take the card away (or cover it with the next one) to scan another.</p>
+      <p class="muted small">Card data &amp; prices (USD) from <a href="https://scryfall.com" target="_blank" rel="noopener">Scryfall</a>. Not affiliated with Wizards of the Coast.</p>
+    </div>
+  </section>
+
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.wasm.min.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
