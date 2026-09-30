@@ -1,6 +1,6 @@
 # local data (rebuilt by update_db.py)
-data/
-exports/
+/data/
+/exports/
 tests/img_cache/
 tests/smoke_exports/
 tests/smoke_*.json
