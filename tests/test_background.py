@@ -223,7 +223,7 @@ class BackgroundTests(unittest.TestCase):
         s2.scale = 0.75
         for ev, x, y in ((scanner.cv2.EVENT_LBUTTONDOWN, 450, 240), (scanner.cv2.EVENT_MOUSEMOVE, 600, 435),
                          (scanner.cv2.EVENT_LBUTTONUP, 600, 435)):
-            s2.on_mouse(ev, x, y, 0, None)
+            s2.on_mouse(ev, x, y + scanner.NAV_H, 0, None)  # window coordinates (tab bar on top)
         self.assertEqual(s2.bg_state, "ok")
         self.assertEqual(s2.background.shape[:2], (s2.zone[3] - s2.zone[1], s2.zone[2] - s2.zone[0]))
         s3 = self.new_scanner()

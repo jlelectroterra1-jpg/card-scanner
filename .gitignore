@@ -14,3 +14,4 @@ tests/smoke_debug/
 tests/smoke_backgrounds/
 tests/smoke_user.db*
 tests/tmp_*/
+tests/ui_shots/

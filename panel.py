@@ -34,6 +34,11 @@ def _font(names, size):
     return ImageFont.load_default(size)
 
 
+def _money(view, usd):
+    fmt = view.get("money")
+    return fmt(usd) if fmt else f"${usd:,.2f}"
+
+
 class Panel:
     def __init__(self, width, height):
         self.W, self.H = width, height
@@ -98,7 +103,7 @@ class Panel:
     def _header(self, d, v):
         p = 16
         d.text((p, 14), f"{v['count']} card{'s' if v['count'] != 1 else ''}", font=self.f["big"], fill=TEXT)
-        total = f"${v['total']:,.2f}"
+        total = _money(v, v['total'])
         d.text((self.W - p, 14), total, font=self.f["big"], fill=GOLD if v["total"] >= 100 else TEXT, anchor="ra")
         x = p
         sub = f"{v['rate']:.0f} cards/min" if v["rate"] else "ready to scan"
@@ -146,7 +151,7 @@ class Panel:
         self._chip(d, x, y, last["finish"].upper() if foil else "NON-FOIL", YELLOW if foil else MUTED)
         y += 32
         price = last["price"]
-        d.text((x, y), f"${price:,.2f}", font=self.f["price"], fill=GOLD if price >= HIGH_VALUE else TEXT)
+        d.text((x, y), _money(v, price), font=self.f["price"], fill=GOLD if price >= HIGH_VALUE else TEXT)
         y += 42
         if last["printings"] > 1:
             d.text((x, y), f"printing {last['printing']} of {last['printings']}", font=self.f["small"], fill=MUTED)
@@ -171,7 +176,7 @@ class Panel:
                 break
             self._paste(img, r["image"], p, y, 20, 28, radius=3)
             price = r["price"]
-            ptxt = f"${price:,.2f}"
+            ptxt = _money(v, price)
             pw = self.f["row"].getlength(ptxt)
             name = r["name"] + (f" ({r['finish']})" if r["finish"] != "nonfoil" else "")
             d.text((p + 30, y + 14), self._fit(name, self.f["row"], self.W - 2 * p - 30 - pw - 60), font=self.f["row"],
@@ -181,6 +186,27 @@ class Panel:
             y += row_h
         if not v["recent"]:
             d.text((p, y + 4), "Nothing yet", font=self.f["small"], fill=MUTED)
+
+    def _destination(self, d, buttons):
+        """Where 'Add to Collection' puts the scanned cards, and the button itself."""
+        dest = self.f
+        p = 16
+        y = self.H - 90
+        v = self._view
+        pending = v.get("pending", 0)
+        name = v.get("destination") or "Main Collection"
+        label = f"To: {name}"
+        lw = self.W - 2 * p - 190
+        box = (p, y, p + lw, y + 34)
+        d.rounded_rectangle(box, radius=8, fill=BUTTON if v.get("can_choose_destination") else CARD_BG)
+        d.text((p + 10, y + 17), self._fit(label, dest["button"], lw - 30), font=dest["button"], fill=TEXT, anchor="lm")
+        if v.get("can_choose_destination"):
+            cx, cy = p + lw - 14, y + 17
+            d.polygon([(cx - 4, cy - 2), (cx + 4, cy - 2), (cx, cy + 3)], fill=MUTED)
+            buttons.append((*box, "destination"))
+        bx = p + lw + 6
+        self._button(d, (bx, y, self.W - p, y + 34), f"Add {pending} to Collection" if pending else "Add to Collection",
+                     "add_collection", buttons, primary=bool(pending))
 
     def _footer_buttons(self, d, buttons):
         p, gap = 16, 6
@@ -285,7 +311,10 @@ class Panel:
             self._review(img, d, view, buttons, top)
         else:
             y = self._last_card(img, d, view, buttons, top)
-            self._recent(img, d, view, y + 4, self.H - 56)
+            self._recent(img, d, view, y + 4, self.H - 96 if view.get("show_destination") else self.H - 56)
+            if view.get("show_destination"):
+                self._view = view
+                self._destination(d, buttons)
         self._footer_buttons(d, buttons)
         out = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
         self._key, self._cache = key, (out, buttons)

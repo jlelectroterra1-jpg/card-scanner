@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from carddb import CardDB
+from currency import display_currency, money as format_money, parse_rate
 from panel import Panel
 from printmatch import IMG_DIR
 from recognizer import Recognizer, looks_empty
@@ -34,6 +35,9 @@ VIEW_W, VIEW_H = 960, 540  # camera preview size on screen
 PANEL_W = 440
 FOOTER_H = 70
 WIN = "Card Scanner"
+NAV_H = 40  # tab bar across the top: Scanner | Collection | Decks | Analyse
+TABS = [("scanner", "Scanner"), ("collection", "Collection"), ("decks", "Decks"), ("analyse", "Analyse")]
+F_KEYS = {0x700000: "scanner", 0x710000: "collection", 0x720000: "decks", 0x730000: "analyse"}  # F1-F4
 UP_KEY, DOWN_KEY = 0x260000, 0x280000  # arrow keys from cv2.waitKeyEx on Windows
 MIN_ZONE_H = 200  # scan box smaller than this (camera pixels) = card too small to recognise
 
@@ -145,6 +149,12 @@ class Scanner:
         self.thumb_cache = {}
         self.panel = Panel(PANEL_W, VIEW_H + FOOTER_H)
         self.panel_buttons = []
+        self.tab = "scanner"
+        self.dialog = None          # pop-up (ui.Dialog) shown over everything
+        self._toast = None
+        self.collection_screen = None
+        self._screen_hits = []
+        self._nav_hits = []
         # Permanent collection/deck database (not used by the scanner screen yet). A
         # problem with it must never stop scanning, so failures are only reported.
         self.userdb = None
@@ -153,6 +163,194 @@ class Scanner:
             self.userdb = UserDB(USER_DB_PATH)
         except Exception as e:  # noqa: BLE001
             print(f"Couldn't open the collection database (data/user.db): {e}")
+
+    # ---- app services (dialogs, messages, currency) ------------------------
+
+    def money(self, usd):
+        return format_money(usd, self.settings)
+
+    def toast(self, text, colour=None):
+        self._toast = (text, colour or (88, 200, 120), time.time())
+        self.set_status(text, GREEN)
+
+    def toast_text(self):
+        if self._toast and time.time() - self._toast[2] < 4:
+            return self._toast[:2]
+        return None
+
+    def open_dialog(self, dialog):
+        self.dialog = dialog
+
+    @staticmethod
+    def export_dir():
+        return EXPORT_DIR
+
+    @staticmethod
+    def ask_open_file(title, filetypes):
+        """Windows' own Open dialog (the only non-OpenCV window in the app)."""
+        try:
+            import tkinter
+            from tkinter import filedialog
+            root = tkinter.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+            root.destroy()
+            return path or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def set_currency(self, cur):
+        if cur == "ZAR" and not self.settings.get("usd_zar"):
+            return self.edit_rate(then_currency="ZAR")
+        self.settings["currency"] = cur
+        save_json(SETTINGS_PATH, self.settings)
+
+    def edit_rate(self, then_currency=None):
+        from ui import Dialog
+
+        def done(ok, text):
+            if not ok:
+                return
+            try:
+                self.settings["usd_zar"] = parse_rate(text)
+            except ValueError:
+                self.toast("That isn't a usable rate - e.g. 17.25", RED)
+                return
+            if then_currency:
+                self.settings["currency"] = then_currency
+            save_json(SETTINGS_PATH, self.settings)
+            self.toast(f"1 USD = R{self.settings['usd_zar']:.2f}")
+        rate = self.settings.get("usd_zar")
+        self.open_dialog(Dialog("Exchange rate", ["How many Rand is 1 US dollar?",
+                                                  "Prices are stored in USD; this only changes what's shown."],
+                                kind="input", numeric=True, text=f"{rate:.2f}" if rate else "", placeholder="e.g. 17.25",
+                                buttons=[("Cancel", None, "normal"), ("Save", True, "primary")], on_done=done))
+
+    # ---- scanned cards -> permanent collection ------------------------------
+
+    def destination_id(self):
+        if self.userdb is None:
+            return None
+        ids = {c["id"] for c in self.userdb.collections()}
+        cid = self.settings.get("destination_collection_id")
+        return cid if cid in ids else self.userdb.default_collection_id()
+
+    def destination_name(self):
+        cid = self.destination_id()
+        return next((c["name"] for c in self.userdb.collections() if c["id"] == cid), "Main Collection")
+
+    def pending_entries(self):
+        return [e for e in self.entries if not e.get("in_collection")]
+
+    def choose_destination(self):
+        from ui import Dialog
+        cols = self.userdb.collections()
+        if len(cols) < 2:
+            return
+
+        def done(v, _t):
+            if v is not None:
+                self.settings["destination_collection_id"] = v
+                save_json(SETTINGS_PATH, self.settings)
+        self.open_dialog(Dialog("Add scanned cards to...", kind="choice", buttons=[("Cancel", None, "normal")],
+                                options=[(c["id"], c["name"], "selected" if c["id"] == self.destination_id() else "normal")
+                                         for c in cols], on_done=done))
+
+    def add_to_collection(self):
+        """Put the scanned cards (not yet added) into the destination collection, in one
+        transaction; then offer to clear the scan list (never cleared silently)."""
+        from ui import Dialog
+        if self.userdb is None:
+            self.set_status("The collection database isn't available", RED)
+            return
+        pending = self.pending_entries()
+        if not pending:
+            self.set_status("Nothing new to add - every scanned card is already in your collection", GREY)
+            return
+        cid, name = self.destination_id(), self.destination_name()
+        try:
+            n = self.userdb.import_session(pending, self.db.by_id, cid, mark=True)
+        except Exception as e:  # noqa: BLE001 - nothing was written (one transaction)
+            self.set_status(f"Couldn't add the cards - nothing was changed: {e}", RED)
+            return
+        self.save_session()
+        if self.collection_screen is not None:
+            self.collection_screen.refresh()
+        beep(True)
+        msg = f"{n} card{'s' if n != 1 else ''} added to {name}"
+        self.set_status(msg, GREEN)
+
+        def done(clear, _t):
+            if clear:
+                if self.entries:
+                    self.export(open_folder=False)  # keep a copy of the list, quietly
+                self.entries = []
+                self.save_session()
+                self.set_status(f"{msg} - scan list cleared (a copy is in exports)", GREEN)
+        self.open_dialog(Dialog(msg, "Clear the scan list now? (A copy is saved to exports first.)",
+                                buttons=[("Keep list", False, "normal"), ("Clear list", True, "primary")], on_done=done))
+
+    # ---- tabs ------------------------------------------------------------------
+
+    def switch_tab(self, tab):
+        if tab == "collection" and self.userdb is not None:
+            if self.collection_screen is None:
+                from collection_view import CollectionScreen
+                self.collection_screen = CollectionScreen(self, VIEW_W + PANEL_W, VIEW_H + FOOTER_H)
+            else:
+                self.collection_screen.refresh()
+        self.tab = tab
+
+    def draw_nav(self, width):
+        from ui import BUTTON_HI, MUTED as UI_MUTED, NAV_BG, Painter
+        p = Painter(width, NAV_H, NAV_BG)
+        x = 12
+        for key, label in TABS:
+            w = p.f["tab"].getlength(label) + 30
+            active = key == self.tab
+            if active:
+                p.d.rounded_rectangle((x, 5, x + w, NAV_H - 5), radius=8, fill=BUTTON_HI)
+            p.text((x + w / 2, NAV_H / 2), label, font="tab", fill=(238, 238, 242) if active else UI_MUTED,
+                   anchor="mm")
+            p.hit((x, 0, x + w, NAV_H), ("tab", key))
+            x += w + 4
+        cur, rate = display_currency(self.settings)
+        xr = width - 12
+        rate_label = f"1 USD = R{self.settings['usd_zar']:.2f}" if self.settings.get("usd_zar") else "set USD/ZAR rate"
+        w = p.f["small"].getlength(rate_label) + 20
+        p.button((xr - w, 7, xr, NAV_H - 7), rate_label, ("rate", None), style="ghost", font="small")
+        xr -= w + 8
+        for code in ("ZAR", "USD"):
+            w = 52
+            p.button((xr - w, 7, xr, NAV_H - 7), code, ("currency", code),
+                     style="selected" if cur == code else "ghost", font="label")
+            xr -= w + 4
+        p.text((xr - 8, NAV_H / 2), "Show prices in", font="small", fill=UI_MUTED, anchor="rm")
+        self._nav_hits = p.hits
+        return p.to_bgr()
+
+    def draw_placeholder(self, width, height, title):
+        from ui import MUTED as UI_MUTED, Painter
+        p = Painter(width, height)
+        p.text((width / 2, height / 2 - 14), title, font="title", anchor="mm")
+        p.text((width / 2, height / 2 + 18), "Coming in a later phase", font="body", fill=UI_MUTED, anchor="mm")
+        return p.to_bgr()
+
+    def draw_window(self, frame):
+        width = VIEW_W + PANEL_W
+        if self.tab == "collection" and self.collection_screen is not None:
+            body, self._screen_hits = self.collection_screen.render()
+        elif self.tab == "collection":
+            body = self.draw_placeholder(width, VIEW_H + FOOTER_H, "Collection unavailable (see the console)")
+        elif self.tab in ("decks", "analyse"):
+            body = self.draw_placeholder(width, VIEW_H + FOOTER_H, dict(TABS)[self.tab])
+        else:
+            body = self.draw(frame)
+        canvas = np.vstack([self.draw_nav(width), body])
+        if self.dialog is not None:
+            canvas = self.dialog.draw(canvas)
+        return canvas
 
     # ---- camera ---------------------------------------------------------
 
@@ -401,7 +599,7 @@ class Scanner:
 
     # ---- export ---------------------------------------------------------
 
-    def export(self):
+    def export(self, open_folder=True):
         if not self.entries:
             self.set_status("Nothing to export yet", RED)
             return
@@ -428,7 +626,7 @@ class Scanner:
                 f.write(f"{qty} {c['name']} ({c['set_code'].upper()}) {c['collector_number']}{tag}\n")
         self.set_status(f"Exported {len(self.entries)} cards to exports\\", GREEN)
         print(f"Exported:\n  {manabox}\n  {plain}")
-        if os.name == "nt":
+        if open_folder and os.name == "nt":
             os.startfile(EXPORT_DIR)
 
     # ---- drawing --------------------------------------------------------
@@ -520,10 +718,15 @@ class Scanner:
                       (meta["zone"][2] - meta["zone"][0], meta["zone"][3] - meta["zone"][1]) if meta.get("zone") else ())))
         view = dict(count=len(self.entries), total=total, rate=rate, lock=self.settings.get("locked_set"),
                     foil_default=self.settings.get("default_finish") == "foil", camera=self.cam_index,
-                    last=last, recent=recent, review=review, typing=self.typing, bg=bg, bg_menu=self.bg_menu)
+                    last=last, recent=recent, review=review, typing=self.typing, bg=bg, bg_menu=self.bg_menu,
+                    money=self.money, show_destination=self.userdb is not None,
+                    destination=self.destination_name() if self.userdb is not None else None,
+                    can_choose_destination=self.userdb is not None and len(self.userdb.collections()) > 1,
+                    pending=len(self.pending_entries()))
         key = (len(self.entries), round(total, 2), round(rate), view["lock"], view["foil_default"], self.cam_index,
                (self.entries[-1]["id"], self.entries[-1]["finish"], self.entries[-1]["alt_idx"]) if self.entries else None,
-               id(self.review), repr(self.typing), self.bg_state, self.bg_menu, meta.get("saved_at"))
+               id(self.review), repr(self.typing), self.bg_state, self.bg_menu, meta.get("saved_at"),
+               display_currency(self.settings), view["destination"], view["can_choose_destination"], view["pending"])
         return view, key
 
     def on_panel_click(self, x, y):
@@ -531,7 +734,11 @@ class Scanner:
             if x0 <= x <= x1 and y0 <= y <= y1:
                 keys = dict(prev="[", next="]", foil="f", remove="u", export="e", lock="l", new="n", camera="c",
                             search="s", skip="x")
-                if action == "bg_menu":
+                if action == "add_collection":
+                    self.add_to_collection()
+                elif action == "destination":
+                    self.choose_destination()
+                elif action == "bg_menu":
                     self.bg_menu = not self.bg_menu
                 elif action == "bg_learn":
                     self.learn_background()
@@ -552,6 +759,38 @@ class Scanner:
     # ---- input ----------------------------------------------------------
 
     def on_mouse(self, event, x, y, flags, _):
+        if self.dialog is not None:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.dialog.click(x, y)
+            elif event == cv2.EVENT_MOUSEWHEEL and hasattr(self.dialog, "wheel"):
+                self.dialog.wheel(cv2.getMouseWheelDelta(flags))
+            if self.dialog is not None and self.dialog.done:
+                self.dialog = None
+            return
+        if y < NAV_H:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                for x0, y0, x1, y1, action in self._nav_hits:
+                    if x0 <= x <= x1 and y0 <= y <= y1:
+                        if action[0] == "tab":
+                            self.switch_tab(action[1])
+                        elif action[0] == "currency":
+                            self.set_currency(action[1])
+                        elif action[0] == "rate":
+                            self.edit_rate()
+                        break
+            return
+        y -= NAV_H
+        if self.tab == "collection" and self.collection_screen is not None:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.collection_screen.click(x, y, self._screen_hits)
+            elif event == cv2.EVENT_MOUSEWHEEL:
+                self.collection_screen.wheel(cv2.getMouseWheelDelta(flags))
+            return
+        if self.tab != "scanner":
+            return
+        self.on_scanner_mouse(event, x, y, flags)
+
+    def on_scanner_mouse(self, event, x, y, flags):
         if x >= VIEW_W:
             if event == cv2.EVENT_LBUTTONDOWN:
                 self.on_panel_click(x - VIEW_W, y)
@@ -580,6 +819,23 @@ class Scanner:
                         self.set_status("Box set & empty desk saved (press B again if a card was in it)", GREEN)
 
     def on_key(self, key):
+        if self.dialog is not None:
+            self.dialog.key(key)
+            if self.dialog.done:
+                self.dialog = None
+            return True
+        if key in F_KEYS:
+            self.switch_tab(F_KEYS[key])
+            return True
+        if self.tab == "collection":
+            if self.collection_screen is not None:
+                self.collection_screen.key(key)
+            return True
+        if self.tab != "scanner":
+            return True
+        return self.on_scanner_key(key)
+
+    def on_scanner_key(self, key):
         if self.typing is not None:
             self.on_typing_key(key)
             return True
@@ -633,6 +889,8 @@ class Scanner:
             self.start_typing("lock", self.settings.get("locked_set") or "")
         elif ch == "s":
             self.start_typing("search")
+        elif ch == "a":
+            self.add_to_collection()
         elif ch == "g":
             foil = self.settings.get("default_finish") == "foil"
             self.settings["default_finish"] = "nonfoil" if foil else "foil"
@@ -703,7 +961,7 @@ class Scanner:
 
     def refresh(self):
         if self.last_frame is not None:
-            cv2.imshow(WIN, self.draw(self.last_frame))
+            cv2.imshow(WIN, self.draw_window(self.last_frame))
             cv2.waitKey(1)
 
     # ---- main loop ------------------------------------------------------
@@ -735,14 +993,14 @@ class Scanner:
                     x0, y0, x1, y1 = self.zone
                     if x1 > w or y1 > h:  # camera resolution changed
                         self.zone = None
-                    elif self.background is not None:
+                    elif self.background is not None and self.tab == "scanner":
                         if not self.bg_verified:
                             self.verify_background(frame)
                         if self.background is not None:
                             self.update_trigger(frame)
             while not self.results.empty():
                 self.handle_result(self.results.get())
-            cv2.imshow(WIN, self.draw(frame))
+            cv2.imshow(WIN, self.draw_window(frame))
             key = cv2.waitKeyEx(1)
             if key != -1 and not self.on_key(key):
                 break

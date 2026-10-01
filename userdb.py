@@ -147,6 +147,18 @@ MIGRATIONS = [
 
         f"""INSERT INTO collections (name, kind, is_default) VALUES ('{DEFAULT_COLLECTION}', 'collection', 1)""",
     ]),
+    (2, "Indexes for browsing large collections; import log", [
+        """CREATE INDEX collection_items_coll_name ON collection_items(collection_id, card_name COLLATE NOCASE)""",
+        """CREATE INDEX collection_items_added ON collection_items(added_at)""",
+        """CREATE INDEX collection_items_price ON collection_items(market_price)""",
+        f"""CREATE TABLE import_log (
+            id INTEGER PRIMARY KEY,
+            source TEXT NOT NULL,                   -- 'scanner' or 'manabox_csv'
+            collection_id INTEGER REFERENCES collections(id) ON DELETE SET NULL,
+            cards INTEGER NOT NULL,                 -- physical copies added
+            details TEXT,
+            created_at TEXT NOT NULL DEFAULT ({NOW}))""",
+    ]),
 ]
 LATEST_VERSION = MIGRATIONS[-1][0]
 
@@ -258,6 +270,55 @@ class UserDB:
             return c.execute("INSERT INTO collections (name, kind, notes) VALUES (?, ?, ?)",
                              (name.strip(), kind, notes)).lastrowid
 
+    def rename_collection(self, collection_id, name):
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("a collection needs a name")
+        with self.transaction() as c:
+            c.execute("UPDATE collections SET name = ? WHERE id = ?", (name, collection_id))
+
+    def collection_counts(self, collection_id):
+        r = self.conn.execute("""SELECT COUNT(*), COALESCE(SUM(quantity), 0) FROM collection_items
+                                 WHERE collection_id = ? AND quantity > 0""", (collection_id,)).fetchone()
+        return dict(lots=r[0], copies=r[1])
+
+    def delete_collection(self, collection_id, contents="refuse", move_to=None):
+        """Delete a collection. contents: 'refuse' (only if empty), 'move' (cards go to
+        `move_to`) or 'delete' (cards are deleted too - refused if any are in decks).
+        The default collection (Main Collection) can never be deleted."""
+        with self.transaction() as c:
+            row = c.execute("SELECT is_default, name FROM collections WHERE id = ?", (collection_id,)).fetchone()
+            if row is None:
+                raise ValueError("no such collection")
+            if row["is_default"]:
+                raise UserDBError(f"{row['name']} is your main collection and can't be deleted")
+            items = [r[0] for r in c.execute("SELECT id FROM collection_items WHERE collection_id = ? AND quantity > 0",
+                                             (collection_id,))]
+            if items and contents == "refuse":
+                raise UserDBError(f"{row['name']} still has cards in it")
+            if items and contents == "move":
+                if move_to is None or move_to == collection_id:
+                    raise ValueError("choose another collection to move the cards to")
+                for i in items:
+                    self._move_lot(c, i, move_to)
+            if contents == "delete" or not items:
+                used = c.execute("""SELECT COALESCE(SUM(dc.quantity), 0) FROM deck_cards dc
+                                    JOIN collection_items ci ON ci.id = dc.collection_item_id
+                                    WHERE ci.collection_id = ?""", (collection_id,)).fetchone()[0]
+                if used:
+                    raise UserDBError(f"{used} card(s) in {row['name']} are used in decks - move them instead")
+                c.execute("DELETE FROM collection_items WHERE collection_id = ?", (collection_id,))
+            c.execute("DELETE FROM collection_items WHERE collection_id = ? AND quantity = 0", (collection_id,))
+            c.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+
+    def log_import(self, source, collection_id, cards, details=None, _conn=None):
+        sql = "INSERT INTO import_log (source, collection_id, cards, details) VALUES (?, ?, ?, ?)"
+        if _conn is not None:
+            _conn.execute(sql, (source, collection_id, cards, details))
+        else:
+            with self.transaction() as c:
+                c.execute(sql, (source, collection_id, cards, details))
+
     def collection_id(self, name):
         r = self.conn.execute("SELECT id FROM collections WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
         return r[0] if r else None
@@ -297,15 +358,111 @@ class UserDB:
             return c.execute(sql, args).fetchone()[0]
 
     def set_quantity(self, item_id, quantity):
+        """Set how many copies are owned. Can't go below the copies used in decks."""
         if quantity < 0:
             raise ValueError("quantity can't be negative")
         with self.transaction() as c:
+            self._check_not_below_allocated(c, item_id, quantity)
             c.execute("UPDATE collection_items SET quantity = ? WHERE id = ?", (quantity, item_id))
 
     def remove_copies(self, item_id, n=1):
         """Take n copies out of a lot (the lot row stays with quantity 0 if it empties)."""
         with self.transaction() as c:
+            q = c.execute("SELECT quantity FROM collection_items WHERE id = ?", (item_id,)).fetchone()
+            if q is None:
+                raise ValueError("no such collection item")
+            self._check_not_below_allocated(c, item_id, max(q[0] - n, 0))
             c.execute("UPDATE collection_items SET quantity = MAX(quantity - ?, 0) WHERE id = ?", (n, item_id))
+
+    @staticmethod
+    def _allocated(c, item_id):
+        return c.execute("SELECT COALESCE(SUM(quantity), 0) FROM deck_cards WHERE collection_item_id = ?",
+                         (item_id,)).fetchone()[0]
+
+    def _check_not_below_allocated(self, c, item_id, new_quantity):
+        used = self._allocated(c, item_id)
+        if new_quantity < used:
+            raise UserDBError(f"{used} cop{'y is' if used == 1 else 'ies are'} used in decks - "
+                              f"take {'it' if used == 1 else 'them'} out of the deck first")
+
+    _UNSET = object()
+
+    def update_item(self, item_id, quantity=None, finish=None, condition=None,
+                    purchase_price=_UNSET, purchase_currency=_UNSET, notes=_UNSET, market_price=_UNSET):
+        """Edit a lot. Changing finish/condition to match another lot of the same card in
+        the same collection merges the two (quantities added, deck links kept). Returns
+        the id of the lot that now holds the cards."""
+        with self.transaction() as c:
+            item = c.execute("SELECT * FROM collection_items WHERE id = ?", (item_id,)).fetchone()
+            if item is None:
+                raise ValueError("no such collection item")
+            if finish is not None and finish not in FINISHES:
+                raise ValueError(f"finish must be one of {FINISHES}")
+            if condition is not None and condition not in CONDITIONS:
+                raise ValueError(f"condition must be one of {CONDITIONS}")
+            if quantity is not None:
+                if quantity < 0:
+                    raise ValueError("quantity can't be negative")
+                self._check_not_below_allocated(c, item_id, quantity)
+            sets, args = [], []
+            for col, val in (("quantity", quantity), ("finish", None), ("condition", None)):
+                if val is not None:
+                    sets.append(f"{col} = ?")
+                    args.append(val)
+            for col, val in (("purchase_price", purchase_price), ("purchase_currency", purchase_currency),
+                             ("notes", notes), ("market_price", market_price)):
+                if val is not self._UNSET:
+                    sets.append(f"{col} = ?")
+                    args.append(val)
+            if market_price is not self._UNSET:
+                sets.append(f"price_updated_at = {NOW}")
+            if sets:
+                c.execute(f"UPDATE collection_items SET {', '.join(sets)} WHERE id = ?", (*args, item_id))
+            new_finish, new_condition = finish or item["finish"], condition or item["condition"]
+            if (new_finish, new_condition) != (item["finish"], item["condition"]):
+                return self._move_lot(c, item_id, item["collection_id"], new_finish, new_condition)
+            return item_id
+
+    def _move_lot(self, c, item_id, collection_id, finish=None, condition=None):
+        """Move a lot to (collection, finish, condition), merging into an existing
+        identical lot if there is one. Deck links follow the cards. Returns the lot id."""
+        item = c.execute("SELECT * FROM collection_items WHERE id = ?", (item_id,)).fetchone()
+        finish, condition = finish or item["finish"], condition or item["condition"]
+        other = c.execute("""SELECT id FROM collection_items WHERE collection_id = ? AND scryfall_id = ?
+                             AND finish = ? AND condition = ? AND language = ? AND id != ?""",
+                          (collection_id, item["scryfall_id"], finish, condition, item["language"], item_id)).fetchone()
+        if other is None:
+            c.execute("UPDATE collection_items SET collection_id = ?, finish = ?, condition = ? WHERE id = ?",
+                      (collection_id, finish, condition, item_id))
+            return item_id
+        target = other[0]
+        c.execute("""UPDATE collection_items SET quantity = quantity + ?,
+                        purchase_price = COALESCE(purchase_price, ?), purchase_currency = COALESCE(purchase_currency, ?),
+                        notes = CASE WHEN notes IS NULL THEN ? WHEN ? IS NULL OR ? = notes THEN notes
+                                     ELSE notes || ' / ' || ? END,
+                        added_at = MIN(added_at, ?)
+                     WHERE id = ?""",
+                  (item["quantity"], item["purchase_price"], item["purchase_currency"], item["notes"],
+                   item["notes"], item["notes"], item["notes"], item["added_at"], target))
+        c.execute("UPDATE deck_cards SET collection_item_id = ? WHERE collection_item_id = ?", (target, item_id))
+        c.execute("DELETE FROM collection_items WHERE id = ?", (item_id,))
+        return target
+
+    def move_items(self, item_ids, collection_id):
+        """Move lots to another collection (merging with identical lots there)."""
+        with self.transaction() as c:
+            if not c.execute("SELECT 1 FROM collections WHERE id = ?", (collection_id,)).fetchone():
+                raise ValueError("no such collection")
+            return [self._move_lot(c, i, collection_id) for i in item_ids]
+
+    def delete_item(self, item_id):
+        """Remove a lot completely. Refused while any copy is used in a deck."""
+        with self.transaction() as c:
+            used = self._allocated(c, item_id)
+            if used:
+                raise UserDBError(f"{used} cop{'y is' if used == 1 else 'ies are'} used in decks - "
+                                  "take them out of the deck first")
+            c.execute("DELETE FROM collection_items WHERE id = ?", (item_id,))
 
     def item(self, item_id):
         r = self.conn.execute("SELECT * FROM collection_items WHERE id = ?", (item_id,)).fetchone()
@@ -351,24 +508,17 @@ class UserDB:
         return self.conn.execute(sql + " WHERE collection_id = ?", (collection_id,)).fetchone()[0]
 
     def refresh_prices(self, cards_db_path=CARDS_DB_PATH):
-        """Update market prices of every lot from Scryfall's cards.db. Returns rows updated."""
-        rows = self.conn.execute("SELECT id, scryfall_id, finish FROM collection_items").fetchall()
-        src = sqlite3.connect(cards_db_path)
-        try:
-            updates = []
-            for r in rows:
-                p = src.execute("SELECT usd, usd_foil, usd_etched FROM cards WHERE id = ?", (r["scryfall_id"],)).fetchone()
-                if not p:
-                    continue
-                usd, foil, etched = p
-                price = {"foil": foil, "etched": etched}.get(r["finish"]) or usd
-                if price is not None:
-                    updates.append((float(price), r["id"]))
-        finally:
-            src.close()
+        """Copy the latest market price for each lot's printing + finish from Scryfall's
+        local cards.db (run Update Prices first to get fresh ones). One SQL update, so
+        it's quick even for 50,000 cards. Returns the number of lots updated."""
+        self.attach_cards_db(cards_db_path)
+        price = """(SELECT CAST(COALESCE(CASE collection_items.finish WHEN 'foil' THEN s.usd_foil
+                                                         WHEN 'etched' THEN s.usd_etched END, s.usd) AS REAL)
+                    FROM scry.cards s WHERE s.id = collection_items.scryfall_id)"""
         with self.transaction() as c:
-            c.executemany(f"UPDATE collection_items SET market_price = ?, price_updated_at = {NOW} WHERE id = ?", updates)
-        return len(updates)
+            cur = c.execute(f"""UPDATE collection_items SET market_price = {price}, price_updated_at = {NOW}
+                                WHERE {price} IS NOT NULL""")
+            return cur.rowcount
 
     # ---- decks ------------------------------------------------------------------
 
@@ -470,10 +620,13 @@ class UserDB:
 
     # ---- scanner session -> collection (not wired to the UI yet) --------------------
 
-    def import_session(self, entries, card_lookup, collection_id=None):
+    def import_session(self, entries, card_lookup, collection_id=None, mark=False):
         """Add the scanner's session entries ({id, finish}) to a collection in one
-        transaction. card_lookup(scryfall_id) -> cards.db row dict. Returns copies added."""
-        added = 0
+        transaction. card_lookup(scryfall_id) -> cards.db row dict. Returns copies added.
+        mark=True sets entry["in_collection"] on each entry that was added (only once the
+        transaction has committed), so a second import doesn't add them twice."""
+        added, done = 0, []
+        collection_id = collection_id or self.default_collection_id()
         with self.transaction() as c:
             for e in entries:
                 card = card_lookup(e["id"])
@@ -485,4 +638,10 @@ class UserDB:
                               language=card.get("lang") or "en", oracle_id=card.get("oracle_id"),
                               market_price=float(price) if price else None, _conn=c)
                 added += 1
+                done.append(e)
+            if added:
+                self.log_import("scanner", collection_id, added, _conn=c)
+        if mark:
+            for e in done:
+                e["in_collection"] = True
         return added

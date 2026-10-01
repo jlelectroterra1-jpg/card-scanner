@@ -31,6 +31,33 @@ box changed since it was learned) or **CHECK BG** (saved view doesn't match what
 sees). Relearn after moving the camera, changing playmat or big lighting changes;
 **K** clears it. Drawing a new scan box learns a new background for it automatically.
 
+## Tabs: Scanner | Collection | Decks | Analyse
+Click the tabs at the top (or F1-F4). Auto-scan only runs on the Scanner tab. Decks and
+Analyse are placeholders for later phases.
+
+**Scanned cards -> collection.** The side panel shows **To: <collection>** (click it to pick
+another, once you have more than one) and **Add N to Collection** (or press **A**). All
+not-yet-added scans go into that collection in one go - identical printing + finish +
+condition + language just increase the quantity - then it asks whether to clear the scan
+list (a copy is saved to `exports\` first). Cards already added are remembered, so pressing
+it again never adds them twice.
+
+**Collection tab.** Collection picker, totals (cards | unique | value), search (name, set
+code or collector number - just start typing), filters (set, finish, condition, rarity,
+colour, type - colour/type need one **Update Prices** run first), sort (highest value first,
+price, name, quantity, set, recently added; or click a column title) and a Statistics panel.
+Click a card for its details: change quantity (+ / -, also keys + and -), finish,
+condition, purchase price and notes; Move to another collection; Remove. Copies used in
+decks can't be removed. **Manage** creates/renames/deletes collections (Main Collection
+can't be deleted; deleting one with cards asks whether to move them or delete them).
+**Refresh prices** copies the latest prices from your local card data into the collection
+(run **Update Prices.bat** first for fresh prices). **Export** writes a ManaBox CSV and a
+plain list. **Import CSV** reads a ManaBox CSV, shows a preview (matched by Scryfall ID, by
+set + number, or name only) and only adds name-only matches if you tick them.
+
+**USD / ZAR.** Top right: switch the display currency and set the rate (1 USD = R...).
+Prices are always stored in USD; ZAR is only how they're shown.
+
 ## Collection database (foundation)
 `data/user.db` (SQLite, created on first start) holds collections (a default
 **Main Collection**, plus binders/boxes), the physical cards in them (printing, finish,
@@ -52,6 +79,8 @@ search are clickable too. All buttons also have keys:
 | drag | set scan box |
 | B | learn / relearn the background (box must be empty) |
 | K | clear the learned background |
+| A | add the scanned cards to the collection |
+| F1-F4 | Scanner / Collection / Decks / Analyse tab |
 | SPACE | scan now |
 | F | cycle foil / etched on the last card |
 | G | make new cards default to foil |
@@ -83,7 +112,9 @@ Prices are Scryfall's USD market prices.
 - `printmatch.py` compares the photo with Scryfall's image of every printing to pick the
   exact one (images are cached in `data/img`).
 
-Tests: `python -m unittest tests.test_background tests.test_userdb` (background + database),
+Tests: `python -m unittest tests.test_collection tests.test_background tests.test_userdb`
+(collection, background, database - 52 tests, includes a 50,000-card speed test),
+`python tests/render_ui.py` (renders the screens to tests/ui_shots for a visual check),
 `python tests/check_far_pipeline.py` (far-away scans end to end),
 `python tests/test_synthetic.py 100` (name reading), `python tests/test_visual.py 200`
 (picture recognition of small, blurry cards) and

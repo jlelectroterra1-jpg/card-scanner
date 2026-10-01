@@ -269,21 +269,22 @@ class UserDBTests(unittest.TestCase):
         db.add_card(**BOLT, quantity=3)
         deck = db.create_deck("Kept")
         db.close()
-        v2 = userdb.MIGRATIONS + [(2, "test: add a binder colour", [
+        nxt = userdb.LATEST_VERSION + 1
+        v2 = userdb.MIGRATIONS + [(nxt, "test: add a binder colour", [
             "ALTER TABLE collections ADD COLUMN colour TEXT",
             "CREATE TABLE wishlist (id INTEGER PRIMARY KEY, card_name TEXT NOT NULL)",
         ])]
         db2 = self.open(migrations=v2)
-        self.assertEqual(db2.applied, [2])
-        self.assertEqual(db2.version, 2)
+        self.assertEqual(db2.applied, [nxt])
+        self.assertEqual(db2.version, nxt)
         self.assertEqual(db2.copies_owned("Lightning Bolt"), 3)
         self.assertEqual(db2.deck(deck)["name"], "Kept")
         db2.conn.execute("UPDATE collections SET colour = 'red'")
         backups = os.listdir(userdb.BACKUP_DIR)
         self.assertEqual(len(backups), 1)
-        self.assertIn("before-v2", backups[0])
+        self.assertIn(f"before-v{nxt}", backups[0])
         b = sqlite3.connect(os.path.join(userdb.BACKUP_DIR, backups[0]))
-        self.assertEqual(b.execute("PRAGMA user_version").fetchone()[0], 1)
+        self.assertEqual(b.execute("PRAGMA user_version").fetchone()[0], userdb.LATEST_VERSION)
         self.assertEqual(b.execute("SELECT SUM(quantity) FROM collection_items").fetchone()[0], 3)
         b.close()
 
@@ -291,14 +292,14 @@ class UserDBTests(unittest.TestCase):
         db = self.open()
         db.add_card(**BOLT, quantity=2)
         db.close()
-        broken = userdb.MIGRATIONS + [(2, "broken", [
+        broken = userdb.MIGRATIONS + [(userdb.LATEST_VERSION + 1, "broken", [
             "ALTER TABLE collections ADD COLUMN colour TEXT",
             "THIS IS NOT SQL",
         ])]
         with self.assertRaises(UserDBError):
             UserDB(self.path, migrations=broken)
         db2 = self.open()
-        self.assertEqual(db2.version, 1)
+        self.assertEqual(db2.version, userdb.LATEST_VERSION)
         self.assertEqual(db2.copies_owned("Lightning Bolt"), 2)
         cols = [r[1] for r in db2.conn.execute("PRAGMA table_info(collections)")]
         self.assertNotIn("colour", cols)  # the half-done step was rolled back
