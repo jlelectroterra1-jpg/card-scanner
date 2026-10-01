@@ -67,7 +67,8 @@ def far_shot(card, bg, rng):
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 100
     db = CardDB()
-    vi = visual.VisualIndex()
+    vi = visual.VisualIndex() if "--old" in sys.argv else visual.load_index()
+    print("using", type(vi).__name__)
     rng = np.random.default_rng(5)
     ids = [str(i) for i in rng.choice(vi.ids, n, replace=False)]
     top1 = top5 = 0

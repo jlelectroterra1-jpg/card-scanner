@@ -176,3 +176,60 @@ class VisualIndex:
             if len(out) == k:
                 break
         return out
+
+
+# ---- trained card model (train_model.py) --------------------------------------
+
+CARD_MODEL = os.path.join(HERE, "data", "vis", "card_embed.onnx")
+CARD_INDEX = os.path.join(HERE, "data", "card_embed_index.npz")
+_IN_W, _IN_H = 128, 176  # must match train_model.py
+
+
+class CardModelIndex:
+    """Recognition with the model trained on fake webcam shots of every artwork.
+    Its fingerprint of the scanned card is compared with its fingerprint of every
+    clean card image; a colour-thumbnail check breaks near-ties."""
+    SHORTLIST = 30
+    COLOUR_WEIGHT = 0.05
+
+    def __init__(self):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(CARD_MODEL, providers=["CPUExecutionProvider"])
+        d = np.load(CARD_INDEX)
+        self.feats = d["feats"].astype(np.float32)
+        self.ids, self.names = d["ids"], d["names"]
+
+    def embed(self, card_bgr):
+        rgb = cv2.cvtColor(cv2.resize(card_bgr, (_IN_W, _IN_H), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
+        x = (((rgb.astype(np.float32) / 255.0) - MEAN) / STD).transpose(2, 0, 1)[None]
+        return self.session.run(None, {"image": x})[0][0]
+
+    def query(self, card_bgr, k=10):
+        sims = self.feats @ self.embed(card_bgr)
+        n = min(self.SHORTLIST, len(sims) - 1)
+        short = np.argpartition(-sims, n)[:n]
+        mine = colour_thumb(card_bgr)
+        scored = []
+        for i in short:
+            ref = _ref_thumb(str(self.ids[i]))
+            dist = trimmed_distance(mine, ref) if ref is not None else 9.0
+            scored.append((float(sims[i]) - self.COLOUR_WEIGHT * dist, i))
+        scored.sort(reverse=True)
+        out, seen = [], set()
+        for score, i in scored:
+            name = str(self.names[i])
+            if name not in seen:
+                seen.add(name)
+                out.append((name, str(self.ids[i]), score))
+            if len(out) == k:
+                break
+        return out
+
+
+def load_index():
+    """The best picture recogniser available: the trained model if it exists."""
+    if os.path.exists(CARD_MODEL) and os.path.exists(CARD_INDEX):
+        return CardModelIndex()
+    if os.path.exists(INDEX_PATH):
+        return VisualIndex()
+    return None

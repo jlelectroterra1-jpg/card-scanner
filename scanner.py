@@ -21,7 +21,6 @@ import numpy as np
 from carddb import CardDB
 from printmatch import IMG_DIR
 from recognizer import Recognizer
-from visual import INDEX_PATH as VISUAL_INDEX
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(HERE, "data", "settings.json")
@@ -116,13 +115,13 @@ class Scanner:
         print("Loading card database...")
         self.db = CardDB()
         print("Loading text reader...")
-        vis = None
-        if os.path.exists(VISUAL_INDEX):
-            print("Loading picture recognition...")
-            from visual import VisualIndex
-            vis = VisualIndex()
-        else:
+        print("Loading picture recognition...")
+        from visual import load_index
+        vis = load_index()
+        if vis is None:
             print("No picture index yet (run build_visual_index.py) - reading names only.")
+        else:
+            print(f"  using {type(vis).__name__}")
         self.rec = Recognizer(self.db, vis)
         self.settings = load_json(SETTINGS_PATH, {})
         if args.camera is not None:
