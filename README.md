@@ -48,10 +48,12 @@ Prices are Scryfall's USD market prices.
 - `update_db.py` downloads Scryfall's bulk card data into `data/cards.db`.
 - `recognizer.py` finds the card in the box, straightens it, and reads the name bar (RapidOCR).
 - `carddb.py` fuzzy-matches the name against all ~34,000 cards.
-- `visual.py` recognises the card by its picture when the name is too small or blurry to
-  read: a MobileNetV2 fingerprint shortlists the 100 closest of ~45,000 artworks, then a
-  colour-thumbnail comparison (ignoring glare/fingers) picks the match. Built by
-  `build_visual_index.py`.
+- `visual.py` recognises the card by its picture, so it works from a distance where the
+  name is unreadable. It uses a model trained by `train_model.py` (run `train.bat`, ~1 hour
+  on an NVIDIA GPU) on millions of fake webcam shots of all ~49,000 artworks: small,
+  blurry, glare, sleeves, fingers, colour casts. In tests it recognised 200/200 cards only
+  ~110-150 px tall. Without the trained model it falls back to a MobileNetV2 +
+  colour-thumbnail index (`build_visual_index.py`), which is much weaker.
 - `printmatch.py` compares the photo with Scryfall's image of every printing to pick the
   exact one (images are cached in `data/img`).
 

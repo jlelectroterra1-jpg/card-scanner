@@ -95,7 +95,7 @@ class Recognizer:
                     vis = flipped
                     best["img"] = cv2.rotate(best["img"], cv2.ROTATE_180)
         vis_gap = (vis[0][2] - vis[1][2]) if len(vis) > 1 else 0
-        vis_sure = bool(vis) and vis_gap >= VIS_GAP
+        vis_sure = bool(vis) and vis_gap >= getattr(self.visual, "SURE_GAP", VIS_GAP)
 
         if best["top"] < 80 and not vis_sure:
             # Showcase / borderless / split frames put the name somewhere else,
@@ -117,7 +117,8 @@ class Recognizer:
             n_top = candidates[0][0] if candidates else None
             if n_top and n_top == v_name and best["top"] >= 60:
                 confident, how = True, "name+picture"  # both agree
-            elif not name_sure and vis_sure:
+            elif vis_sure and best["top"] < 97:
+                # A clear picture match beats a shaky name read (e.g. "Natural Spring" read as "Slay").
                 candidates, confident, how = [(v_name, 100.0)] + [c for c in candidates if c[0] != v_name], True, "picture"
             elif not name_sure:
                 # Not sure either way: offer the best guesses from both, agreeing ones first.

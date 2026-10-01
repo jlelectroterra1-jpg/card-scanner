@@ -144,6 +144,7 @@ def _ref_thumb(card_id):
 class VisualIndex:
     SHORTLIST = 100
     FINGERPRINT_WEIGHT = 3.0
+    SURE_GAP = 0.20  # lead over the next card needed to add without asking
 
     def __init__(self, path=INDEX_PATH):
         d = np.load(path)
@@ -191,6 +192,7 @@ class CardModelIndex:
     clean card image; a colour-thumbnail check breaks near-ties."""
     SHORTLIST = 30
     COLOUR_WEIGHT = 0.05
+    SURE_GAP = 0.10
 
     def __init__(self):
         import onnxruntime as ort

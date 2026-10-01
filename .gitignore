@@ -10,3 +10,4 @@ __pycache__/
 *.part
 .claude/
 tests/exp_cache.pkl
+tests/smoke_debug/
