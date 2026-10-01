@@ -37,7 +37,7 @@ MIN_ZONE_H = 200  # scan box smaller than this (camera pixels) = card too small 
 PRESENT_FRAC = 0.20   # this share of the zone must differ from the empty desk
 CHANGE_FRAC = 0.20    # ...or from the last scanned card, to count as "something new"
 STILL_LEVEL = 4.0     # mean pixel change between frames below this = not moving
-STILL_FRAMES = 6      # ~0.2 s at 30 fps
+STILL_FRAMES = 4      # ~0.13 s at 30 fps
 
 GREEN, YELLOW, RED, WHITE, GREY = (80, 200, 80), (0, 210, 255), (60, 60, 230), (240, 240, 240), (150, 150, 150)
 KEYS_HELP = [

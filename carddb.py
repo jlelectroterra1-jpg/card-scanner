@@ -59,6 +59,19 @@ class CardDB:
         ranked = self.ranked_printings(name, footer_text, locked_set, card_img)
         return ranked[0] if ranked else None
 
+    def printings_for_art(self, name, art_id, locked_set=None):
+        """Printings of `name` with the recognised artwork's printing first, then
+        regular printings over promos / The List, newest first. No image downloads."""
+        prints = [p for p in self.printings(name) if p["lang"] == "en"] or self.printings(name)
+        if locked_set:
+            in_set = [p for p in prints if p["set_code"] == locked_set]
+            if in_set:
+                return in_set + [p for p in prints if p["set_code"] != locked_set]
+        regular = lambda p: not p["promo"] and p["set_code"] != "plst"
+        first = [p for p in prints if p["id"] == art_id]
+        rest = sorted((p for p in prints if p["id"] != art_id), key=lambda p: not regular(p))
+        return first + rest
+
     def ranked_printings(self, name, footer_text="", locked_set=None, card_img=None):
         """All printings of `name`, most likely first: by how it looks (compared
         with Scryfall's images), then the set code / collector number read from

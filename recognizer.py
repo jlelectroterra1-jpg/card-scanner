@@ -70,9 +70,26 @@ class Recognizer:
             return ""
         return res.txts[0].strip()
 
+    def picture_first(self, card_bgr, locked_set=None):
+        """Fast path: if the picture model clearly knows the card, skip text reading
+        entirely and take the printing from the matched artwork (no downloads)."""
+        sure_gap = getattr(self.visual, "SURE_GAP", VIS_GAP)
+        for img in (card_bgr, cv2.rotate(card_bgr, cv2.ROTATE_180)):
+            vis = self.visual.query(img, k=5)
+            if len(vis) > 1 and vis[0][2] - vis[1][2] >= sure_gap:
+                name, art_id = vis[0][0], vis[0][1]
+                return dict(name_text="", footer_text="", candidates=[(n, 100 * max(0.0, sc)) for n, _, sc in vis],
+                            printings=self.db.printings_for_art(name, art_id, locked_set),
+                            confident=True, card=img, how="picture")
+        return None
+
     def identify(self, card_bgr, locked_set=None):
         """Returns dict(name_text, footer_text, candidates=[(name, score)],
         printings=[most likely first], confident, card=straightened image, how)."""
+        if self.visual is not None:
+            fast = self.picture_first(card_bgr, locked_set)
+            if fast and fast["printings"]:
+                return fast
         best = None
         # Cards can land upside down; try both ways and keep whichever reads better.
         for img in (card_bgr, cv2.rotate(card_bgr, cv2.ROTATE_180)):
