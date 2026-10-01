@@ -66,7 +66,9 @@ def build():
             id TEXT PRIMARY KEY, name TEXT, set_code TEXT, set_name TEXT,
             collector_number TEXT, rarity TEXT, lang TEXT, released_at TEXT,
             finishes TEXT, promo INTEGER, usd TEXT, usd_foil TEXT, usd_etched TEXT, eur TEXT,
-            image_small TEXT, image_normal TEXT
+            image_small TEXT, image_normal TEXT,
+            -- for collection/deck features (added in Phase 1; older cards.db files lack them)
+            oracle_id TEXT, type_line TEXT, color_identity TEXT, legal_commander TEXT
         );
         CREATE TABLE names (lookup TEXT, name TEXT);
     """)
@@ -87,6 +89,9 @@ def build():
                 ",".join(c.get("finishes") or []), int(bool(c.get("promo"))),
                 p.get("usd"), p.get("usd_foil"), p.get("usd_etched"), p.get("eur"),
                 image_url(c, "small"), image_url(c, "normal"),
+                c.get("oracle_id") or ((c.get("card_faces") or [{}])[0].get("oracle_id")),
+                c.get("type_line") or " // ".join(f.get("type_line", "") for f in c.get("card_faces") or []),
+                "".join(c.get("color_identity") or []), (c.get("legalities") or {}).get("commander"),
             ))
             # The scanner reads the name printed at the top of the card, which for
             # split / double-faced cards is just one face, so index every face name.
@@ -99,9 +104,10 @@ def build():
             for alt in (c.get("printed_name"), c.get("flavor_name")):
                 if alt:
                     names.add((alt, c["name"]))
-    db.executemany("INSERT OR REPLACE INTO cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    db.executemany("INSERT OR REPLACE INTO cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     db.executemany("INSERT INTO names VALUES (?,?)", sorted(names))
-    db.executescript("CREATE INDEX idx_name ON cards(name); CREATE INDEX idx_set ON cards(set_code);")
+    db.executescript("CREATE INDEX idx_name ON cards(name); CREATE INDEX idx_set ON cards(set_code); "
+                     "CREATE INDEX idx_oracle ON cards(oracle_id);")
     db.commit()
     db.close()
     os.replace(tmp, DB_PATH)

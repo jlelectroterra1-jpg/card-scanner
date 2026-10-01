@@ -108,6 +108,10 @@ class Panel:
             x = self._chip(d, x, 46, f"SET {v['lock'].upper()}", YELLOW)
         if v.get("foil_default"):
             x = self._chip(d, x, 46, "FOIL", YELLOW)
+        bg = v.get("bg") or {}
+        label, colour = {"ok": ("BG OK", GREEN), "check": ("CHECK BG", YELLOW),
+                         "stale": ("RELEARN BG", YELLOW)}.get(bg.get("state"), ("NO BG", RED))
+        x = self._chip(d, x, 46, label, colour)
         cam = f"camera {v['camera']}"
         d.text((self.W - p, 56), cam, font=self.f["small"], fill=MUTED, anchor="rm")
         d.line((p, 76, self.W - p, 76), fill=BUTTON, width=1)
@@ -169,7 +173,7 @@ class Panel:
             price = r["price"]
             ptxt = f"${price:,.2f}"
             pw = self.f["row"].getlength(ptxt)
-            name = r["name"] + (" ★" if r["finish"] != "nonfoil" else "")
+            name = r["name"] + (f" ({r['finish']})" if r["finish"] != "nonfoil" else "")
             d.text((p + 30, y + 14), self._fit(name, self.f["row"], self.W - 2 * p - 30 - pw - 60), font=self.f["row"],
                    fill=TEXT, anchor="lm")
             d.text((self.W - p - pw - 10, y + 14), r["set_code"].upper(), font=self.f["small"], fill=MUTED, anchor="rm")
@@ -179,13 +183,47 @@ class Panel:
             d.text((p, y + 4), "Nothing yet", font=self.f["small"], fill=MUTED)
 
     def _footer_buttons(self, d, buttons):
-        p = 16
+        p, gap = 16, 6
         y = self.H - 46
-        bw = (self.W - 2 * p - 3 * 6) / 4
-        for i, (label, action, primary) in enumerate([("Export", "export", True), ("Lock set", "lock", False),
-                                                     ("New list", "new", False), ("Camera", "camera", False)]):
-            x0 = p + i * (bw + 6)
-            self._button(d, (int(x0), y, int(x0 + bw), y + 32), label, action, buttons, primary=primary)
+        items = [("Export", "export", True), ("Lock set", "lock", False), ("New list", "new", False),
+                 ("Camera", "camera", False), ("Background", "bg_menu", False)]
+        widths = [self.f["button"].getlength(label) + 16 for label, _, _ in items]
+        extra = (self.W - 2 * p - gap * (len(items) - 1) - sum(widths)) / len(items)
+        x0 = p
+        for (label, action, primary), w in zip(items, widths):
+            w += extra
+            self._button(d, (int(x0), y, int(x0 + w), y + 32), label, action, buttons, primary=primary)
+            x0 += w + gap
+
+    def _background_menu(self, img, d, v, buttons, top):
+        p = 16
+        bg = v.get("bg") or {}
+        d.text((p, top), "Background", font=self.f["name"], fill=YELLOW)
+        y = top + 34
+        state = bg.get("state")
+        status = {"ok": ("Learned - empty playmat is ignored.", GREEN),
+                  "check": ("Saved background doesn't match what the camera sees now.", YELLOW),
+                  "stale": ("Saved background is for a different camera or scan box.", YELLOW)}.get(
+            state, ("No background learned - auto-scan is off.", RED))
+        d.text((p, y), status[0], font=self.f["body"], fill=status[1])
+        y += 24
+        if bg.get("saved_at"):
+            d.text((p, y), f"Learned {bg['saved_at']}  ·  camera {bg.get('camera')}  ·  box {bg.get('zone_text', '')}",
+                   font=self.f["small"], fill=MUTED)
+            y += 22
+        for line in ["Take every card out of the scan box, then press Learn.",
+                     "The scanner remembers it (also after restarting) and won't",
+                     "treat the empty playmat as a card. Relearn if the camera,",
+                     "the box, the playmat or the lighting changes a lot."]:
+            d.text((p, y + 6), line, font=self.f["small"], fill=TEXT)
+            y += 20
+        y += 18
+        self._button(d, (p, y, self.W - p, y + 36),
+                     "Relearn background (B)" if state else "Learn background (B)", "bg_learn", buttons, primary=True)
+        y += 44
+        half = (self.W - 2 * p - 6) / 2
+        self._button(d, (p, y, int(p + half), y + 34), "Clear background (K)", "bg_clear", buttons, danger=True)
+        self._button(d, (int(p + half + 6), y, self.W - p, y + 34), "Close", "bg_close", buttons)
 
     def _review(self, img, d, v, buttons, top):
         p = 16
@@ -239,7 +277,9 @@ class Panel:
         buttons = []
         self._header(d, view)
         top = 90
-        if view.get("typing"):
+        if view.get("bg_menu"):
+            self._background_menu(img, d, view, buttons, top)
+        elif view.get("typing"):
             self._typing(img, d, view, buttons, top)
         elif view.get("review"):
             self._review(img, d, view, buttons, top)

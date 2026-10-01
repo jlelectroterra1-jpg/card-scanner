@@ -10,6 +10,8 @@ scanner.SESSION_PATH = os.path.join(os.path.dirname(__file__), "smoke_session.js
 scanner.SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "smoke_settings.json")
 scanner.EXPORT_DIR = os.path.join(os.path.dirname(__file__), "smoke_exports")
 scanner.DEBUG_DIR = os.path.join(os.path.dirname(__file__), "smoke_debug")
+scanner.BACKGROUND_DIR = os.path.join(os.path.dirname(__file__), "smoke_backgrounds")
+scanner.USER_DB_PATH = os.path.join(os.path.dirname(__file__), "smoke_user.db")
 for p in (scanner.SESSION_PATH, scanner.SETTINGS_PATH):
     if os.path.exists(p): os.remove(p)
 

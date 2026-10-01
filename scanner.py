@@ -21,12 +21,14 @@ import numpy as np
 from carddb import CardDB
 from panel import Panel
 from printmatch import IMG_DIR
-from recognizer import Recognizer
+from recognizer import Recognizer, looks_empty
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(HERE, "data", "settings.json")
 SESSION_PATH = os.path.join(HERE, "data", "session.json")
 EXPORT_DIR = os.path.join(HERE, "exports")
+BACKGROUND_DIR = os.path.join(HERE, "data", "backgrounds")  # learned empty-box photos, one per camera
+USER_DB_PATH = os.path.join(HERE, "data", "user.db")  # permanent collection/deck database (userdb.py)
 
 VIEW_W, VIEW_H = 960, 540  # camera preview size on screen
 PANEL_W = 440
@@ -126,7 +128,8 @@ class Scanner:
         self.open_camera(self.settings.get("camera", 0))
 
         self.zone = self.settings.get("zone")  # [x0, y0, x1, y1] in camera pixels
-        self.background = None
+        self.bg_menu = False
+        self.load_background()  # the learned empty box for this camera + box, if saved earlier
         self.drag = None
         self.prev_small = None
         self.still = 0
@@ -142,6 +145,14 @@ class Scanner:
         self.thumb_cache = {}
         self.panel = Panel(PANEL_W, VIEW_H + FOOTER_H)
         self.panel_buttons = []
+        # Permanent collection/deck database (not used by the scanner screen yet). A
+        # problem with it must never stop scanning, so failures are only reported.
+        self.userdb = None
+        try:
+            from userdb import UserDB
+            self.userdb = UserDB(USER_DB_PATH)
+        except Exception as e:  # noqa: BLE001
+            print(f"Couldn't open the collection database (data/user.db): {e}")
 
     # ---- camera ---------------------------------------------------------
 
@@ -158,6 +169,8 @@ class Scanner:
         self.settings["camera"] = index
         self.cam_index = index
         self.background = None
+        if hasattr(self, "zone"):  # (not yet during start-up; __init__ loads it once the box is known)
+            self.load_background()
         ok, frame = cap.read()
         if ok:
             print(f"Camera {index}: {frame.shape[1]}x{frame.shape[0]}")
@@ -181,10 +194,80 @@ class Scanner:
         return float((np.abs(a - b) > level).mean())
 
     def capture_background(self, frame):
+        """Learn the current (empty) scan box as the background, and remember it on disk."""
         self.background = self.zone_crop(frame).copy()
         self.armed = True
         self.last_scanned_small = None
-        self.set_status("Empty desk saved - put a card in the box", GREEN)
+        self.bg_state, self.bg_verified = "ok", True
+        try:
+            self.save_background(frame)
+            self.set_status("Background learned and saved - put a card in the box", GREEN)
+        except OSError as e:
+            self.set_status(f"Background learned, but couldn't save it to disk: {e}", YELLOW)
+
+    def background_path(self):
+        return os.path.join(BACKGROUND_DIR, f"camera{self.cam_index}.png")
+
+    def background_meta(self):
+        return (self.settings.get("backgrounds") or {}).get(str(self.cam_index))
+
+    def save_background(self, frame):
+        os.makedirs(BACKGROUND_DIR, exist_ok=True)
+        path = self.background_path()
+        ok, data = cv2.imencode(".png", self.background)
+        if not ok:
+            raise OSError("couldn't encode the image")
+        with open(path + ".part", "wb") as f:
+            f.write(data.tobytes())
+        os.replace(path + ".part", path)
+        h, w = frame.shape[:2]
+        self.settings.setdefault("backgrounds", {})[str(self.cam_index)] = dict(
+            file=os.path.basename(path), zone=list(self.zone), frame_size=[w, h],
+            saved_at=datetime.now().isoformat(timespec="seconds"))
+        save_json(SETTINGS_PATH, self.settings)
+
+    def load_background(self):
+        """Use the saved background only if it belongs to this camera and this exact box."""
+        self.background, self.bg_verified = None, False
+        meta = self.background_meta()
+        if not self.zone or not meta:
+            self.bg_state = None
+            return
+        x0, y0, x1, y1 = self.zone
+        img = cv2.imread(os.path.join(BACKGROUND_DIR, meta.get("file", "")))
+        if list(meta.get("zone") or []) != list(self.zone) or img is None or img.shape[:2] != (y1 - y0, x1 - x0):
+            self.bg_state = "stale"  # camera or box changed since it was learned
+            return
+        self.background, self.bg_state = img, "ok"
+
+    def verify_background(self, frame):
+        """First frame after loading: is the saved background still plausible?"""
+        self.bg_verified = True
+        meta = self.background_meta() or {}
+        h, w = frame.shape[:2]
+        if meta.get("frame_size") and list(meta["frame_size"]) != [w, h]:
+            self.background, self.bg_state = None, "stale"
+            self.set_status("Camera resolution changed - clear the box and press B to relearn the background", YELLOW)
+        elif not looks_empty(self.zone_crop(frame), self.background):
+            # A card may simply be lying in the box, so keep using it - but say so.
+            self.bg_state = "check"
+            self.set_status("Saved background doesn't match the view - if the box is empty, press B to relearn", YELLOW)
+
+    def clear_background(self):
+        self.background, self.bg_state = None, None
+        (self.settings.get("backgrounds") or {}).pop(str(self.cam_index), None)
+        save_json(SETTINGS_PATH, self.settings)
+        try:
+            os.remove(self.background_path())
+        except OSError:
+            pass
+        self.set_status("Background cleared - auto-scan is off until you learn one (B)", YELLOW)
+
+    def learn_background(self):
+        if not self.zone:
+            self.set_status("Drag a scan box first", RED)
+        elif self.last_frame is not None:
+            self.capture_background(self.last_frame)
 
     def update_trigger(self, frame):
         """Watch the zone and start a scan when a new card has settled in it."""
@@ -196,6 +279,10 @@ class Scanner:
         self.prev_small = s
         bg_small = self.small(self.background)
         present = self.frac_diff(s, bg_small) > PRESENT_FRAC
+        if present and looks_empty(z, self.background):
+            present = False  # same playmat, just lighter/darker than when it was learned
+        if not present and self.bg_state == "check" and looks_empty(z, self.background):
+            self.bg_state = "ok"  # the saved background matches again
         if not self.armed:
             # Wait until the last card is taken away or covered by a new one.
             if not present or (self.last_scanned_small is not None
@@ -216,16 +303,21 @@ class Scanner:
 
         def work():
             t = time.time()
-            card = self.rec.find_card(z, bg)
-            if card is None:
-                card = self.rec.find_card(z, None)
-            if card is None:
-                if not manual:
-                    # Nothing card-shaped (empty playmat, a hand): don't guess.
+            if manual:  # SPACE pressed: always try, as before
+                card = self.rec.find_card(z, bg)
+                if card is None:
+                    card = self.rec.find_card(z, None)
+                if card is None:
+                    card = cv2.resize(z, (630, 880))  # assume the box is snug around the card
+            else:
+                # Auto-scan: only go on with convincing evidence of a real card (different
+                # from the learned background, card-shaped, big enough), so the playmat's
+                # own artwork never reaches recognition.
+                card, why = self.rec.find_card_checked(z, bg)
+                if card is None:
                     self.results.put(dict(candidates=[], printings=[], confident=False, name_text="",
-                                          card=None, no_card=True))
+                                          card=None, no_card=True, why=why))
                     return
-                card = cv2.resize(z, (630, 880))  # SPACE pressed: assume the box is snug around the card
             try:
                 res = self.rec.identify(card, locked)
             except Exception as e:  # never let one bad frame kill the scanner
@@ -375,7 +467,7 @@ class Scanner:
             put(canvas, "Drag a box where your cards will land", (20, 40), YELLOW, 0.8)
 
         put(canvas, self.status, (12, VIEW_H + 24), self.status_color, 0.6)
-        put(canvas, "Drag on the video to move the scan box  -  B = re-photo the empty desk  -  SPACE = scan now  -  Q = quit",
+        put(canvas, "Drag on the video to move the scan box  -  B = learn background  -  SPACE = scan now  -  Q = quit",
             (12, VIEW_H + 52), GREY, 0.42)
         self.draw_panel(canvas)
         return canvas
@@ -422,12 +514,16 @@ class Scanner:
                 prints = self.db.printings(name)
                 choices.append(dict(name=name, score=score, image=self.thumb(prints[0]["id"], 40) if prints else None))
             review = dict(image=self.review["card"], choices=choices)
+        meta = self.background_meta() or {}
+        bg = dict(state=self.bg_state, saved_at=(meta.get("saved_at") or "").replace("T", " ")[:16],
+                  camera=self.cam_index, zone_text="x".join(str(v) for v in (
+                      (meta["zone"][2] - meta["zone"][0], meta["zone"][3] - meta["zone"][1]) if meta.get("zone") else ())))
         view = dict(count=len(self.entries), total=total, rate=rate, lock=self.settings.get("locked_set"),
                     foil_default=self.settings.get("default_finish") == "foil", camera=self.cam_index,
-                    last=last, recent=recent, review=review, typing=self.typing)
+                    last=last, recent=recent, review=review, typing=self.typing, bg=bg, bg_menu=self.bg_menu)
         key = (len(self.entries), round(total, 2), round(rate), view["lock"], view["foil_default"], self.cam_index,
                (self.entries[-1]["id"], self.entries[-1]["finish"], self.entries[-1]["alt_idx"]) if self.entries else None,
-               id(self.review), repr(self.typing))
+               id(self.review), repr(self.typing), self.bg_state, self.bg_menu, meta.get("saved_at"))
         return view, key
 
     def on_panel_click(self, x, y):
@@ -435,7 +531,16 @@ class Scanner:
             if x0 <= x <= x1 and y0 <= y <= y1:
                 keys = dict(prev="[", next="]", foil="f", remove="u", export="e", lock="l", new="n", camera="c",
                             search="s", skip="x")
-                if action in keys:
+                if action == "bg_menu":
+                    self.bg_menu = not self.bg_menu
+                elif action == "bg_learn":
+                    self.learn_background()
+                    self.bg_menu = False
+                elif action == "bg_clear":
+                    self.clear_background()
+                elif action == "bg_close":
+                    self.bg_menu = False
+                elif action in keys:
                     self.on_key(ord(keys[action]))
                 elif action.startswith("pick:"):
                     self.choose_candidate(int(action[5:]))
@@ -478,6 +583,16 @@ class Scanner:
         if self.typing is not None:
             self.on_typing_key(key)
             return True
+        if self.bg_menu:
+            ch = chr(key).lower() if 0 <= key < 256 else ""
+            if ch == "b":
+                self.learn_background()
+                self.bg_menu = False
+            elif ch == "k":
+                self.clear_background()
+            elif key == 27 or ch == "q":
+                self.bg_menu = False
+            return True
         if key in (ord("q"), 27):
             return False
         ch = chr(key).lower() if 0 <= key < 256 else ""
@@ -492,8 +607,10 @@ class Scanner:
             elif key == 13 and self.review["candidates"]:
                 self.choose_candidate(0)
             return True
-        if ch == "b" and self.zone and self.last_frame is not None:
-            self.capture_background(self.last_frame)
+        if ch == "b":
+            self.learn_background()
+        elif ch == "k":
+            self.clear_background()
         elif key == 32 and self.zone and self.last_frame is not None and not self.busy:
             self.start_scan(self.last_frame, manual=True)
         elif ch == "f":
@@ -594,7 +711,14 @@ class Scanner:
     def run(self):
         cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
         cv2.setMouseCallback(WIN, self.on_mouse)
-        self.set_status("Ready" if self.zone else "Drag a box where cards will land", WHITE)
+        if not self.zone:
+            self.set_status("Drag a box where cards will land", WHITE)
+        elif self.bg_state == "ok":
+            self.set_status("Ready - background loaded", GREEN)
+        elif self.bg_state == "stale":
+            self.set_status("Background is for a different camera/box - clear the box and press B", YELLOW)
+        else:
+            self.set_status("No background yet - clear the box and press B (or Background > Learn)", YELLOW)
         fails = 0
         while True:
             ok, frame = self.cap.read()
@@ -612,7 +736,10 @@ class Scanner:
                     if x1 > w or y1 > h:  # camera resolution changed
                         self.zone = None
                     elif self.background is not None:
-                        self.update_trigger(frame)
+                        if not self.bg_verified:
+                            self.verify_background(frame)
+                        if self.background is not None:
+                            self.update_trigger(frame)
             while not self.results.empty():
                 self.handle_result(self.results.get())
             cv2.imshow(WIN, self.draw(frame))
@@ -623,6 +750,8 @@ class Scanner:
                 break
         self.save_session()
         save_json(SETTINGS_PATH, self.settings)
+        if self.userdb is not None:
+            self.userdb.close()
         self.cap.release()
         cv2.destroyAllWindows()
         print(f"Saved {len(self.entries)} cards. Press E next time to export, or they'll still be here.")

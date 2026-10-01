@@ -5,3 +5,5 @@ requests
 rapidocr
 onnxruntime
 onnx
+Pillow
+# training the card model only (train_model.py): torch, torchvision (CUDA build)

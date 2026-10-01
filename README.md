@@ -21,6 +21,25 @@ The bigger the card looks in the camera, the better: put the webcam about 20-30 
 the desk. A phone through Camo gives a sharper picture than the C270 (press **C** to
 switch cameras).
 
+## Background (stops the playmat being scanned)
+With the scan box **empty**, press **B** (or **Background > Learn**). The scanner saves that
+empty view to `data/backgrounds/camera<N>.png` (+ details in `data/settings.json`) and
+reloads it every time it starts. Auto-scan only reads something that is clearly different
+from it, card-shaped and big enough, so the playmat's own artwork (even under brighter or
+darker light) is ignored. The header shows **BG OK**, **NO BG**, **RELEARN BG** (camera or
+box changed since it was learned) or **CHECK BG** (saved view doesn't match what the camera
+sees). Relearn after moving the camera, changing playmat or big lighting changes;
+**K** clears it. Drawing a new scan box learns a new background for it automatically.
+
+## Collection database (foundation)
+`data/user.db` (SQLite, created on first start) holds collections (a default
+**Main Collection**, plus binders/boxes), the physical cards in them (printing, finish,
+condition, language, quantity, prices, notes) and decks (commander/partner, cards, which
+owned copy each deck card uses). See `userdb.py`. Schema upgrades are automatic, run in a
+transaction, and back the file up to `data/backups/` first. The scanning list
+(`data/session.json`) and Export work exactly as before; moving scans into the collection
+is a later step (`UserDB.import_session` exists but isn't wired to a button yet).
+
 ## Side panel
 Shows the card count, total value and scanning speed; the last card (picture, set,
 rarity, price) with **‹ Print / Print ›**, **Foil** and **Remove** buttons; recent cards;
@@ -31,7 +50,8 @@ search are clickable too. All buttons also have keys:
 | Key | Does |
 |---|---|
 | drag | set scan box |
-| B | re-take the empty-desk photo |
+| B | learn / relearn the background (box must be empty) |
+| K | clear the learned background |
 | SPACE | scan now |
 | F | cycle foil / etched on the last card |
 | G | make new cards default to foil |
@@ -63,7 +83,9 @@ Prices are Scryfall's USD market prices.
 - `printmatch.py` compares the photo with Scryfall's image of every printing to pick the
   exact one (images are cached in `data/img`).
 
-Tests: `python tests/test_synthetic.py 100` (name reading), `python tests/test_visual.py 200`
+Tests: `python -m unittest tests.test_background tests.test_userdb` (background + database),
+`python tests/check_far_pipeline.py` (far-away scans end to end),
+`python tests/test_synthetic.py 100` (name reading), `python tests/test_visual.py 200`
 (picture recognition of small, blurry cards) and
 `python tests/test_scanner_smoke.py` (auto-scan loop).
 

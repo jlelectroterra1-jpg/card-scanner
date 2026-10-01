@@ -11,3 +11,6 @@ __pycache__/
 .claude/
 tests/exp_cache.pkl
 tests/smoke_debug/
+tests/smoke_backgrounds/
+tests/smoke_user.db*
+tests/tmp_*/

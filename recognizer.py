@@ -15,6 +15,45 @@ FOOTER_LINES = [(0.04, 0.925, 0.45, 0.958), (0.04, 0.944, 0.45, 0.977)]
 # (calibrated with tests/test_visual.py).
 VIS_GAP = 0.20
 
+# "Is there really a card?" checks, used before auto-scans when an empty-background photo
+# is known. Similarity is lighting-independent (zero-mean normalised correlation), so a
+# brighter/darker view of the same playmat still counts as "the background".
+# On real scans: empty playmat vs its learned background 0.99-1.00, cards vs background <= 0.39.
+EMPTY_SIMILARITY = 0.80   # whole box this similar to the background...
+EMPTY_CHANGED_FRAC = 0.12  # ...and less than this share changed beyond a brightness shift -> nothing there
+REGION_SIMILARITY = 0.60  # the "card" found is this similar to the same spot of the background -> playmat art
+MIN_CARD_FRAC = 0.08      # a card must cover at least this share of the scan box
+FILLS_BOX_CHANGED_FRAC = 0.30  # no outline found, but this much of the box is new -> the card fills the box (real: empty <0.01, cards >=0.44)
+CARD_ASPECT = (0.50, 0.95)  # short side / long side (a Magic card is 0.716; a finger over an edge squares it up)
+
+
+def background_similarity(img_a, img_b):
+    """How alike two views of the same area are, ignoring brightness/contrast changes:
+    1.0 = same picture, ~0 = unrelated. Small shifts and noise are smoothed away."""
+    def norm(img):
+        g = cv2.cvtColor(cv2.resize(img, (48, 64), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        g = cv2.GaussianBlur(g.astype(np.float32), (3, 3), 0)
+        return (g - g.mean()) / (g.std() + 1e-3)
+    return float((norm(img_a) * norm(img_b)).mean())
+
+
+def changed_fraction(img, background, level=28):
+    """Share of the area that differs from the background after allowing for an
+    overall brightness change (the room getting lighter/darker)."""
+    a = cv2.GaussianBlur(cv2.cvtColor(cv2.resize(img, (64, 85), interpolation=cv2.INTER_AREA),
+                                      cv2.COLOR_BGR2GRAY).astype(np.float32), (5, 5), 0)
+    b = cv2.GaussianBlur(cv2.cvtColor(cv2.resize(background, (64, 85), interpolation=cv2.INTER_AREA),
+                                      cv2.COLOR_BGR2GRAY).astype(np.float32), (5, 5), 0)
+    gain = float(np.clip(np.median((a + 8) / (b + 8)), 0.5, 2.0))
+    return float((np.abs(a - gain * b) > level).mean())
+
+
+def looks_empty(zone, background):
+    """True when the scan box shows just the learned background: same pattern
+    (lighting-independent) and nothing new beyond an overall brightness change."""
+    return (background_similarity(zone, background) >= EMPTY_SIMILARITY
+            and changed_fraction(zone, background) < EMPTY_CHANGED_FRAC)
+
 
 class Recognizer:
     def __init__(self, db, visual_index=None):
@@ -30,6 +69,12 @@ class Recognizer:
 
         With an empty-desk background we look at what changed; that copes with
         wood grain, playmats etc. Without one we fall back to edge detection."""
+        box = Recognizer.card_quad(zone_bgr, background_bgr)
+        return None if box is None else warp_card(zone_bgr, box)
+
+    @staticmethod
+    def card_quad(zone_bgr, background_bgr=None):
+        """The card's four corners (tl, tr, br, bl, portrait) in the zone, or None."""
         h, w = zone_bgr.shape[:2]
         if background_bgr is not None:
             diff = cv2.absdiff(cv2.GaussianBlur(zone_bgr, (5, 5), 0), cv2.GaussianBlur(background_bgr, (5, 5), 0))
@@ -67,13 +112,46 @@ class Recognizer:
         if background_bgr is not None and cv2.contourArea(c) > 0.85 * w * h:
             # Nearly the whole box "changed": the light changed, not just a card
             # arriving. Find the card by its edges instead.
-            return Recognizer.find_card(zone_bgr, None)
+            return Recognizer.card_quad(zone_bgr, None)
         box = order_corners(cv2.boxPoints(cv2.minAreaRect(c)))
         tl, tr, br, bl = box
         if np.linalg.norm(tr - tl) > np.linalg.norm(bl - tl):  # lying sideways -> make it portrait
             box = np.array([tr, br, bl, tl], dtype=np.float32)
-        dst = np.array([[0, 0], [CARD_W - 1, 0], [CARD_W - 1, CARD_H - 1], [0, CARD_H - 1]], dtype=np.float32)
-        return cv2.warpPerspective(zone_bgr, cv2.getPerspectiveTransform(box, dst), (CARD_W, CARD_H))
+        return box
+
+    @staticmethod
+    def find_card_checked(zone_bgr, background_bgr):
+        """Like find_card, but only returns a card when there is convincing evidence a
+        real one is there, so an empty playmat (with card-like shapes in its artwork)
+        never reaches recognition. Returns (card or None, reason)."""
+        if background_bgr is None or background_bgr.shape != zone_bgr.shape:
+            card = Recognizer.find_card(zone_bgr, None)
+            return card, ("edges" if card is not None else "no card shape")
+        if looks_empty(zone_bgr, background_bgr):
+            return None, "matches background"
+        h, w = zone_bgr.shape[:2]
+        for box in (Recognizer.card_quad(zone_bgr, background_bgr), Recognizer.card_quad(zone_bgr, None)):
+            if box is None:
+                continue
+            tl, tr, br, bl = box
+            side_w, side_h = np.linalg.norm(tr - tl), np.linalg.norm(bl - tl)
+            if side_w * side_h < MIN_CARD_FRAC * w * h:
+                continue
+            if not CARD_ASPECT[0] <= min(side_w, side_h) / max(side_w, side_h, 1e-3) <= CARD_ASPECT[1]:
+                continue
+            card = warp_card(zone_bgr, box)
+            under = warp_card(background_bgr, box)
+            if (background_similarity(card, under) >= REGION_SIMILARITY
+                    and changed_fraction(card, under) < EMPTY_CHANGED_FRAC):
+                continue  # that "card" is part of the background picture (e.g. playmat art)
+            return card, "ok"
+        # A card (often on top of a stack) that fills the whole box has no outline inside
+        # it to find. Accept the box itself, but only when most of it is clearly new
+        # compared with the learned background - an empty playmat can never pass this.
+        if (changed_fraction(zone_bgr, background_bgr) >= FILLS_BOX_CHANGED_FRAC
+                and background_similarity(zone_bgr, background_bgr) < REGION_SIMILARITY):
+            return cv2.resize(zone_bgr, (CARD_W, CARD_H), interpolation=cv2.INTER_AREA), "fills box"
+        return None, "no card shape"
 
     # ---- reading --------------------------------------------------------
 
@@ -182,6 +260,11 @@ class Recognizer:
 
 def second_score(cands):
     return cands[1][1] if len(cands) > 1 else 0
+
+
+def warp_card(img, box):
+    dst = np.array([[0, 0], [CARD_W - 1, 0], [CARD_W - 1, CARD_H - 1], [0, CARD_H - 1]], dtype=np.float32)
+    return cv2.warpPerspective(img, cv2.getPerspectiveTransform(np.asarray(box, np.float32), dst), (CARD_W, CARD_H))
 
 
 def order_corners(pts):
