@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from carddb import CardDB
+from panel import Panel
 from printmatch import IMG_DIR
 from recognizer import Recognizer
 
@@ -28,7 +29,8 @@ SESSION_PATH = os.path.join(HERE, "data", "session.json")
 EXPORT_DIR = os.path.join(HERE, "exports")
 
 VIEW_W, VIEW_H = 960, 540  # camera preview size on screen
-PANEL_W = 420
+PANEL_W = 440
+FOOTER_H = 70
 WIN = "Card Scanner"
 UP_KEY, DOWN_KEY = 0x260000, 0x280000  # arrow keys from cv2.waitKeyEx on Windows
 MIN_ZONE_H = 200  # scan box smaller than this (camera pixels) = card too small to recognise
@@ -40,13 +42,6 @@ STILL_LEVEL = 4.0     # mean pixel change between frames below this = not moving
 STILL_FRAMES = 4      # ~0.13 s at 30 fps
 
 GREEN, YELLOW, RED, WHITE, GREY = (80, 200, 80), (0, 210, 255), (60, 60, 230), (240, 240, 240), (150, 150, 150)
-KEYS_HELP = [
-    "drag = scan zone   B = empty-desk photo   SPACE = scan now   S = add by name",
-    "F = foil   G = foil by default   [ ] = printing   DEL = remove last   L = lock set",
-    "E = export   C = camera   N = new list   Q = quit",
-]
-
-
 def ascii_text(s):
     return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
 
@@ -145,6 +140,8 @@ class Scanner:
         self.last_frame = None
         self.new_list_pressed = 0.0
         self.thumb_cache = {}
+        self.panel = Panel(PANEL_W, VIEW_H + FOOTER_H)
+        self.panel_buttons = []
 
     # ---- camera ---------------------------------------------------------
 
@@ -247,7 +244,7 @@ class Scanner:
             self.set_status("Ready", WHITE)
             return
         if res["confident"] and res["printings"]:
-            self.add_card(res["printings"], res["card"])
+            self.add_card(res["printings"], res["card"], res.get("how"))
             beep(True)
         elif res["candidates"]:
             self.review = res
@@ -272,13 +269,13 @@ class Scanner:
             self.add_card(prints, res["card"])
             beep(True)
 
-    def add_card(self, printings, card_img):
+    def add_card(self, printings, card_img, how=None):
         top = printings[0]
         finish = self.settings.get("default_finish", "nonfoil")
         if finish not in (top["finishes"] or "nonfoil").split(","):
             finish = (top["finishes"] or "nonfoil").split(",")[0]
         self.entries.append(dict(
-            id=top["id"], finish=finish, alts=[p["id"] for p in printings[:40]], alt_idx=0,
+            id=top["id"], finish=finish, alts=[p["id"] for p in printings[:40]], alt_idx=0, how=how,
             time=datetime.now().isoformat(timespec="seconds"),
         ))
         self.save_session()
@@ -364,7 +361,7 @@ class Scanner:
         fh, fw = frame.shape[:2]
         self.scale = min(VIEW_W / fw, VIEW_H / fh)
         view = cv2.resize(frame, (int(fw * self.scale), int(fh * self.scale)))
-        canvas = np.full((VIEW_H + 70, VIEW_W + PANEL_W, 3), 28, np.uint8)
+        canvas = np.full((VIEW_H + FOOTER_H, VIEW_W + PANEL_W, 3), 28, np.uint8)
         canvas[:view.shape[0], :view.shape[1]] = view
 
         box = self.drag or self.zone
@@ -378,74 +375,83 @@ class Scanner:
             put(canvas, "Drag a box where your cards will land", (20, 40), YELLOW, 0.8)
 
         put(canvas, self.status, (12, VIEW_H + 24), self.status_color, 0.6)
-        for i, line in enumerate(KEYS_HELP[:2]):
-            put(canvas, line, (12, VIEW_H + 46 + i * 18), GREY, 0.42)
-        put(canvas, KEYS_HELP[2], (VIEW_W - 330, VIEW_H + 64), GREY, 0.42)
+        put(canvas, "Drag on the video to move the scan box  -  B = re-photo the empty desk  -  SPACE = scan now  -  Q = quit",
+            (12, VIEW_H + 52), GREY, 0.42)
         self.draw_panel(canvas)
         return canvas
 
     def draw_panel(self, canvas):
-        x = VIEW_W + 14
-        total = sum(price_of(self.db.by_id(e["id"]) or {}, e["finish"]) for e in self.entries)
-        put(canvas, f"{len(self.entries)} cards   ${total:,.2f}", (x, 30), WHITE, 0.7)
-        lock = self.settings.get("locked_set")
-        put(canvas, f"camera {self.cam_index}" + (f"   set locked: {lock.upper()}" if lock else "")
-            + ("   default: FOIL" if self.settings.get("default_finish") == "foil" else ""), (x, 52), GREY, 0.45)
+        view, key = self.panel_view()
+        img, self.panel_buttons = self.panel.render(view, key)
+        canvas[:, VIEW_W:VIEW_W + PANEL_W] = img
 
-        if self.typing is not None:
-            t = self.typing
-            put(canvas, "Type the card name:" if t["kind"] == "search" else "Set code to lock (empty = any set):",
-                (x, 90), YELLOW, 0.6)
-            put(canvas, t["text"] + "_", (x, 124), WHITE, 0.7)
-            for i, name in enumerate(t["matches"]):
-                sel = i == t["sel"]
-                put(canvas, ("> " if sel else "  ") + ascii_text(name)[:34], (x, 160 + i * 26), GREEN if sel else WHITE, 0.55)
-            put(canvas, "ENTER = ok   ESC = cancel" + ("   up/down = choose" if t["kind"] == "search" else ""),
-                (x, 300), GREY, 0.45)
-            if self.review is not None:
-                canvas[320:530, x:x + 150] = cv2.resize(self.review["card"], (150, 210))
-            return
+    def panel_view(self):
+        """Everything the side panel shows, plus a key that changes when it does."""
+        def card_info(e):
+            c = self.db.by_id(e["id"]) or {}
+            return c, price_of(c, e["finish"])
 
-        if self.review is not None:
-            put(canvas, "Which card is it?", (x, 90), YELLOW, 0.65)
-            for i, (name, score) in enumerate(self.review["candidates"][:5]):
-                put(canvas, f"{i + 1}. {ascii_text(name)[:32]}", (x, 120 + i * 26), WHITE, 0.55)
-                put(canvas, f"{score:.0f}%", (x + 360, 120 + i * 26), GREY, 0.45)
-            put(canvas, "X = skip    S = search by name", (x, 262), GREY, 0.5)
-            card = cv2.resize(self.review["card"], (150, 210))
-            canvas[290:500, x:x + 150] = card
-            return
-
+        total = 0.0
+        for e in self.entries:
+            total += card_info(e)[1]
+        # Scanning speed over the last 5 minutes.
+        rate = 0.0
+        recent_times = [e["time"] for e in self.entries[-200:] if e.get("time")]
+        if len(recent_times) >= 3:
+            ts = [datetime.fromisoformat(t).timestamp() for t in recent_times]
+            ts = [t for t in ts if t >= ts[-1] - 300]
+            if len(ts) >= 3 and ts[-1] > ts[0]:
+                rate = (len(ts) - 1) / (ts[-1] - ts[0]) * 60
+        last = None
         if self.entries:
             e = self.entries[-1]
-            c = self.db.by_id(e["id"])
-            t = self.thumb(e["id"], 150)
-            if t is not None:
-                h = min(t.shape[0], 212)
-                canvas[70:70 + h, x:x + 150] = t[:h]
-            tx = x + 162
-            put(canvas, ascii_text(c["name"])[:22], (tx, 90), WHITE, 0.55)
-            put(canvas, ascii_text(c["set_name"])[:26], (tx, 114), GREY, 0.45)
-            put(canvas, f"{c['set_code'].upper()} #{c['collector_number']}  {c['rarity']}", (tx, 136), GREY, 0.45)
-            put(canvas, e["finish"].upper() if e["finish"] != "nonfoil" else "non-foil", (tx, 158),
-                YELLOW if e["finish"] != "nonfoil" else GREY, 0.45)
-            p = price_of(c, e["finish"])
-            put(canvas, f"${p:,.2f}", (tx, 188), (0, 180, 255) if p >= 5 else WHITE, 0.7)
-            put(canvas, f"printing {e['alt_idx'] + 1}/{len(e['alts'])}  [ ]", (tx, 212), GREY, 0.42)
+            c, price = card_info(e)
+            last = dict(name=c.get("name", "?"), set_name=c.get("set_name", ""), set_code=c.get("set_code", ""),
+                        number=c.get("collector_number", ""), rarity=c.get("rarity", ""), finish=e["finish"],
+                        price=price, printing=e["alt_idx"] + 1, printings=len(e["alts"]), how=e.get("how"),
+                        image=self.thumb(e["id"], 296))
+        recent = []
+        for e in reversed(self.entries[-12:-1]):
+            c, price = card_info(e)
+            recent.append(dict(name=c.get("name", "?"), set_code=c.get("set_code", ""), finish=e["finish"],
+                               price=price, image=self.thumb(e["id"], 40)))
+        review = None
+        if self.review is not None:
+            choices = []
+            for name, score in self.review["candidates"][:5]:
+                prints = self.db.printings(name)
+                choices.append(dict(name=name, score=score, image=self.thumb(prints[0]["id"], 40) if prints else None))
+            review = dict(image=self.review["card"], choices=choices)
+        view = dict(count=len(self.entries), total=total, rate=rate, lock=self.settings.get("locked_set"),
+                    foil_default=self.settings.get("default_finish") == "foil", camera=self.cam_index,
+                    last=last, recent=recent, review=review, typing=self.typing)
+        key = (len(self.entries), round(total, 2), round(rate), view["lock"], view["foil_default"], self.cam_index,
+               (self.entries[-1]["id"], self.entries[-1]["finish"], self.entries[-1]["alt_idx"]) if self.entries else None,
+               id(self.review), repr(self.typing))
+        return view, key
 
-        y = 310
-        for e in reversed(self.entries[-10:-1] if len(self.entries) > 1 else []):
-            c = self.db.by_id(e["id"])
-            p = price_of(c, e["finish"])
-            f = "*" if e["finish"] != "nonfoil" else ""
-            put(canvas, f"{ascii_text(c['name'])[:26]}{f}", (x, y), WHITE, 0.45)
-            put(canvas, f"{c['set_code'].upper()}  ${p:,.2f}", (x + 290, y), (0, 180, 255) if p >= 5 else GREY, 0.42)
-            y += 24
+    def on_panel_click(self, x, y):
+        for x0, y0, x1, y1, action in self.panel_buttons:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                keys = dict(prev="[", next="]", foil="f", remove="u", export="e", lock="l", new="n", camera="c",
+                            search="s", skip="x")
+                if action in keys:
+                    self.on_key(ord(keys[action]))
+                elif action.startswith("pick:"):
+                    self.choose_candidate(int(action[5:]))
+                elif action.startswith("sugg:") and self.typing is not None:
+                    self.typing["sel"] = int(action[5:])
+                    self.finish_typing()
+                return
 
     # ---- input ----------------------------------------------------------
 
     def on_mouse(self, event, x, y, flags, _):
-        if x >= VIEW_W or not hasattr(self, "scale"):
+        if x >= VIEW_W:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.on_panel_click(x - VIEW_W, y)
+            return
+        if not hasattr(self, "scale"):
             return
         cx, cy = int(x / self.scale), int(y / self.scale)
         if event == cv2.EVENT_LBUTTONDOWN:

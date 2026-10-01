@@ -21,6 +21,12 @@ The bigger the card looks in the camera, the better: put the webcam about 20-30 
 the desk. A phone through Camo gives a sharper picture than the C270 (press **C** to
 switch cameras).
 
+## Side panel
+Shows the card count, total value and scanning speed; the last card (picture, set,
+rarity, price) with **‹ Print / Print ›**, **Foil** and **Remove** buttons; recent cards;
+and **Export / Lock set / New list / Camera** buttons. "Which card?" choices and name
+search are clickable too. All buttons also have keys:
+
 ## Keys
 | Key | Does |
 |---|---|

@@ -52,8 +52,33 @@ class CardDB:
         return dict(r) if r else None
 
     def search(self, text, limit=8):
-        """Name search for the manual 'find card' box."""
-        return [n for n, _ in self.match_name(text, limit)]
+        """Search-as-you-type: names starting with the text first (shortest first),
+        then names containing it, then fuzzy matches for typos."""
+        q = normalise(text)
+        if len(q) < 2:
+            return []
+        out = []
+
+        def add(lookup):
+            names = self.by_lookup[lookup]
+            exact = [n for n in names if normalise(n) == lookup]
+            name = (exact or names)[0]
+            # Skip "Sol Ring // Sol Ring"-style reprints when the plain card is already listed.
+            if name not in out and not any(part in out for part in name.split(" // ")):
+                out.append(name)
+
+        for lk in sorted((l for l in self.lookups if l.startswith(q)), key=len):
+            add(lk)
+            if len(out) >= limit:
+                return out
+        for lk in sorted((l for l in self.lookups if q in l and not l.startswith(q)), key=len):
+            add(lk)
+            if len(out) >= limit:
+                return out
+        for n, _ in self.match_name(text, limit):
+            if n not in out:
+                out.append(n)
+        return out[:limit]
 
     def pick_printing(self, name, footer_text="", locked_set=None, card_img=None):
         ranked = self.ranked_printings(name, footer_text, locked_set, card_img)
