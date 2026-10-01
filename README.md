@@ -32,8 +32,7 @@ sees). Relearn after moving the camera, changing playmat or big lighting changes
 **K** clears it. Drawing a new scan box learns a new background for it automatically.
 
 ## Tabs: Scanner | Collection | Decks | Analyse
-Click the tabs at the top (or F1-F4). Auto-scan only runs on the Scanner tab. Analyse is a
-placeholder for a later phase.
+Click the tabs at the top (or F1-F4). Auto-scan only runs on the Scanner tab.
 
 **Scanned cards -> collection.** The side panel shows **To: <collection>** (click it to pick
 another, once you have more than one) and **Add N to Collection** (or press **A**). All
@@ -74,6 +73,36 @@ Add Card searches by name and printing. More: rename, duplicate (the copy only u
 copies), import (plain/Moxfield/Archidekt/ManaBox text or CSV, with a preview), export
 (decklist + CSV), link owned copies, delete (confirmation; Collection cards stay, their
 copies become free).
+
+**Analyse tab (Commander deck analyser).** Pick a deck, then choose:
+- **Suggest cards from:** *My Collection* (default - only cards you own with a free copy,
+  cost R0) or *All Cards* (any legal card in the commander's colours, with a **total**
+  budget for the whole package: R0 / R250 / R500 / R1,000 / No limit / Other).
+- **Deck goal:** Casual (few, on-theme changes), Improve It (default), High Power.
+- **Strategy:** detected from the commander and the deck; **Edit** to choose your own
+  themes (they override the detected ones) or go back to the detected ones.
+
+**Analyse Deck** runs in the background (a few seconds) and shows:
+- **Overview:** lands (basic / other), ramp, draw, removal, wipes, counterspells,
+  protection, tutors, recursion and finishers against typical ranges for the goal; mana
+  curve and average mana value; colour symbols; detected strategy with reasons; potential
+  weaknesses.
+- **Swaps:** OUT -> IN pairs with pictures, ownership (owned & available / owned but used in
+  another deck / not owned), cost, a confidence label and plain-English reasons. Tick the
+  ones you want and press **Apply selected changes** - you see the full list first, the
+  deck is snapshotted, then changed in one step (owned free copies are linked; nothing is
+  taken from other decks). **Undo last change** puts the deck back exactly. Commanders and
+  lands are never suggested as cuts, nor are Game Changers / widely played expensive staples
+  when improving a deck.
+- **Combos** (optional, online): **Check combos** sends the deck list once to
+  [Commander Spellbook](https://commanderspellbook.com) and lists combos in the deck or one
+  card away (with ownership of the missing piece). Nothing goes online unless you press it.
+
+The analysis is saved and re-shown next time; a yellow banner says when the deck,
+collection, settings or card data changed since. Everything works offline from your own
+card data - no EDHREC data is used (**EDHREC (browser)** just opens the commander's page in
+your browser for your own reference) and no AI service is called. Suggestions are advice:
+the deck only changes when you apply them.
 
 **USD / ZAR.** Top right: switch the display currency and set the rate (1 USD = R...).
 Prices are always stored in USD; ZAR is only how they're shown.
@@ -129,12 +158,22 @@ Prices are Scryfall's USD market prices.
   blurry, glare, sleeves, fingers, colour casts. In tests it recognised 200/200 cards only
   ~110-150 px tall. Without the trained model it falls back to a MobileNetV2 +
   colour-thumbnail index (`build_visual_index.py`), which is much weaker.
+- `cardroles.py` works out each card's jobs (ramp, draw, removal...) from its rules text with
+  a confidence and reason; `strategy.py` detects deck themes; `analyser.py` scores cuts and
+  replacements (commander synergy, strategy, need, mana efficiency, interaction, quality),
+  builds the swap package within the budget and applies/undoes swaps; `analyse_view.py` is
+  the screen; `providers.py` holds optional outside data (Commander Spellbook) and the
+  EDHREC link.
 - `printmatch.py` compares the photo with Scryfall's image of every printing to pick the
   exact one (images are cached in `data/img`).
 
 Tests: `python -m unittest tests.test_decks tests.test_deck_workflow tests.test_collection tests.test_background tests.test_userdb`
 (decks incl. a full scan-a-deck workflow, collection, background, database - 71 tests, includes
 a 50,000-card speed test),
+`python -m unittest tests.test_analyser` (deck analyser: roles, strategy, composition, cuts,
+replacements, modes, budget, ownership, apply/undo, caching, providers and the full Analyse
+screen workflow - 36 tests), `python tests/demo_analysis.py all improve 500` (prints a sample
+analysis),
 `python tests/render_ui.py` (renders the screens to tests/ui_shots for a visual check),
 `python tests/check_far_pipeline.py` (far-away scans end to end),
 `python tests/test_synthetic.py 100` (name reading), `python tests/test_visual.py 200`

@@ -189,6 +189,40 @@ MIGRATIONS = [
                         AND role IN ('commander', 'partner', 'main')) AS card_count
             FROM decks d""",
     ]),
+    (4, "Deck analyser: role cache, analysis settings, analyses, deck snapshots, applied changes", [
+        # Card roles worked out by cardroles.py, cached (rebuilt when the classifier or cards.db changes).
+        """CREATE TABLE card_role_cache (oracle_id TEXT PRIMARY KEY, name TEXT NOT NULL, roles TEXT NOT NULL)""",
+        f"""CREATE TABLE analysis_profiles (
+            deck_id INTEGER PRIMARY KEY REFERENCES decks(id) ON DELETE CASCADE,
+            mode TEXT NOT NULL DEFAULT 'collection' CHECK (mode IN ('collection', 'all')),
+            goal TEXT NOT NULL DEFAULT 'improve' CHECK (goal IN ('casual', 'improve', 'high')),
+            tags TEXT,              -- JSON list of deck goals chosen by the user; NULL = use detected
+            budget_usd REAL,        -- All Cards mode: total spend allowed; NULL = unlimited
+            updated_at TEXT NOT NULL DEFAULT ({NOW}))""",
+        f"""CREATE TABLE deck_analyses (
+            id INTEGER PRIMARY KEY,
+            deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+            fingerprint TEXT NOT NULL,   -- deck + collection + settings + card data it was based on
+            settings TEXT NOT NULL,
+            result TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT ({NOW}))""",
+        """CREATE INDEX deck_analyses_deck ON deck_analyses(deck_id, id)""",
+        f"""CREATE TABLE deck_snapshots (
+            id INTEGER PRIMARY KEY,
+            deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+            reason TEXT,
+            cards TEXT NOT NULL,         -- JSON copy of the deck's deck_cards rows
+            created_at TEXT NOT NULL DEFAULT ({NOW}))""",
+        f"""CREATE TABLE applied_changes (
+            id INTEGER PRIMARY KEY,
+            deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+            analysis_id INTEGER REFERENCES deck_analyses(id) ON DELETE SET NULL,
+            snapshot_id INTEGER REFERENCES deck_snapshots(id) ON DELETE SET NULL,
+            swaps TEXT NOT NULL,          -- JSON list of swaps (out / in cards)
+            created_at TEXT NOT NULL DEFAULT ({NOW}),
+            undone_at TEXT)""",
+        """CREATE INDEX applied_changes_deck ON applied_changes(deck_id, id)""",
+    ]),
 ]
 LATEST_VERSION = MIGRATIONS[-1][0]
 
@@ -732,6 +766,127 @@ class UserDB:
         r = self.conn.execute("SELECT * FROM collection_item_availability WHERE collection_item_id = ?",
                               (item_id,)).fetchone()
         return dict(r) if r else None
+
+    # ---- deck analyser: settings, history, snapshots ------------------------------------
+
+    def meta_get(self, key, default=None):
+        r = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return r[0] if r else default
+
+    def meta_set(self, key, value, _conn=None):
+        sql = "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+        if _conn is not None:
+            _conn.execute(sql, (key, value))
+        else:
+            with self.transaction() as c:
+                c.execute(sql, (key, value))
+
+    def analysis_profile(self, deck_id):
+        import json
+        r = self.conn.execute("SELECT * FROM analysis_profiles WHERE deck_id = ?", (deck_id,)).fetchone()
+        if r is None:
+            return dict(deck_id=deck_id, mode="collection", goal="improve", tags=None, budget_usd=None)
+        d = dict(r)
+        d["tags"] = json.loads(d["tags"]) if d["tags"] else None
+        return d
+
+    def save_analysis_profile(self, deck_id, mode=None, goal=None, tags=_UNSET, budget_usd=_UNSET):
+        import json
+        cur = self.analysis_profile(deck_id)
+        mode = mode or cur["mode"]
+        goal = goal or cur["goal"]
+        tags = cur["tags"] if tags is self._UNSET else tags
+        budget = cur["budget_usd"] if budget_usd is self._UNSET else budget_usd
+        with self.transaction() as c:
+            c.execute(f"""INSERT INTO analysis_profiles (deck_id, mode, goal, tags, budget_usd) VALUES (?, ?, ?, ?, ?)
+                          ON CONFLICT (deck_id) DO UPDATE SET mode = excluded.mode, goal = excluded.goal,
+                          tags = excluded.tags, budget_usd = excluded.budget_usd, updated_at = {NOW}""",
+                      (deck_id, mode, goal, json.dumps(tags) if tags is not None else None, budget))
+
+    def save_analysis(self, deck_id, fingerprint, settings, result):
+        import json
+        with self.transaction() as c:
+            return c.execute("INSERT INTO deck_analyses (deck_id, fingerprint, settings, result) VALUES (?, ?, ?, ?)",
+                             (deck_id, fingerprint, json.dumps(settings), json.dumps(result))).lastrowid
+
+    def latest_analysis(self, deck_id):
+        import json
+        r = self.conn.execute("SELECT * FROM deck_analyses WHERE deck_id = ? ORDER BY id DESC LIMIT 1",
+                              (deck_id,)).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        d["settings"], d["result"] = json.loads(d["settings"]), json.loads(d["result"])
+        return d
+
+    def snapshot_deck(self, deck_id, reason="", _conn=None):
+        """Save a copy of the deck's card list (for undo). Returns the snapshot id."""
+        import json
+
+        def run(c):
+            rows = [dict(r) for r in c.execute("SELECT * FROM deck_cards WHERE deck_id = ? ORDER BY id", (deck_id,))]
+            return c.execute("INSERT INTO deck_snapshots (deck_id, reason, cards) VALUES (?, ?, ?)",
+                             (deck_id, reason, json.dumps(rows))).lastrowid
+        if _conn is not None:
+            return run(_conn)
+        with self.transaction() as c:
+            return run(c)
+
+    def restore_snapshot(self, snapshot_id):
+        """Put a deck's card list back exactly as it was in a snapshot. Links to collection
+        copies are kept only while those copies are still free (never taken from another
+        deck); the rest are left unlinked. Returns the deck id."""
+        import json
+        with self.transaction() as c:
+            snap = c.execute("SELECT * FROM deck_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+            if snap is None:
+                raise ValueError("no such snapshot")
+            deck_id = snap["deck_id"]
+            c.execute("DELETE FROM deck_cards WHERE deck_id = ?", (deck_id,))
+            for r in json.loads(snap["cards"]):
+                item = r.get("collection_item_id")
+                if item is not None:
+                    lot = c.execute("SELECT quantity FROM collection_items WHERE id = ?", (item,)).fetchone()
+                    used = c.execute("SELECT COALESCE(SUM(quantity), 0) FROM deck_cards WHERE collection_item_id = ?",
+                                     (item,)).fetchone()[0]
+                    if lot is None or lot[0] - used < r["quantity"]:
+                        item = None
+                c.execute("""INSERT INTO deck_cards (deck_id, card_name, oracle_id, scryfall_id, quantity, finish, role,
+                                                     collection_item_id, physical, source, added_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (deck_id, r["card_name"], r.get("oracle_id"), r.get("scryfall_id"), r["quantity"],
+                           r.get("finish"), r["role"], item, r.get("physical") or 0, r.get("source"),
+                           r.get("added_at") or _now()))
+            return deck_id
+
+    def log_applied(self, deck_id, analysis_id, snapshot_id, swaps, _conn=None):
+        import json
+        sql = "INSERT INTO applied_changes (deck_id, analysis_id, snapshot_id, swaps) VALUES (?, ?, ?, ?)"
+        args = (deck_id, analysis_id, snapshot_id, json.dumps(swaps))
+        if _conn is not None:
+            return _conn.execute(sql, args).lastrowid
+        with self.transaction() as c:
+            return c.execute(sql, args).lastrowid
+
+    def last_applied(self, deck_id):
+        import json
+        r = self.conn.execute("""SELECT * FROM applied_changes WHERE deck_id = ? AND undone_at IS NULL
+                                 ORDER BY id DESC LIMIT 1""", (deck_id,)).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        d["swaps"] = json.loads(d["swaps"])
+        return d
+
+    def undo_applied(self, applied_id):
+        """Restore the deck from the snapshot taken before these changes."""
+        r = self.conn.execute("SELECT * FROM applied_changes WHERE id = ?", (applied_id,)).fetchone()
+        if r is None or r["undone_at"] or r["snapshot_id"] is None:
+            raise UserDBError("those changes can't be undone")
+        deck_id = self.restore_snapshot(r["snapshot_id"])
+        with self.transaction() as c:
+            c.execute(f"UPDATE applied_changes SET undone_at = {NOW} WHERE id = ?", (applied_id,))
+        return deck_id
 
     # ---- joins with Scryfall's card data ------------------------------------------
 

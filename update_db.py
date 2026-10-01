@@ -71,8 +71,14 @@ def build():
             oracle_id TEXT, type_line TEXT, color_identity TEXT, legal_commander TEXT
         );
         CREATE TABLE names (lookup TEXT, name TEXT);
+        -- One row per card (not per printing): rules text etc. for the deck analyser (Phase 4).
+        CREATE TABLE oracle_cards (
+            oracle_id TEXT PRIMARY KEY, name TEXT, mana_cost TEXT, cmc REAL, type_line TEXT,
+            oracle_text TEXT, keywords TEXT, power TEXT, toughness TEXT, color_identity TEXT,
+            legal_commander TEXT, game_changer INTEGER
+        );
     """)
-    rows, names = [], set()
+    rows, names, oracle = [], set(), {}
     opener = gzip.open if RAW_PATH.endswith(".gz") else open
     with opener(RAW_PATH, "rt", encoding="utf-8") as f:
         for line in f:
@@ -93,6 +99,18 @@ def build():
                 c.get("type_line") or " // ".join(f.get("type_line", "") for f in c.get("card_faces") or []),
                 "".join(c.get("color_identity") or []), (c.get("legalities") or {}).get("commander"),
             ))
+            oid = c.get("oracle_id") or ((c.get("card_faces") or [{}])[0].get("oracle_id"))
+            if oid and (oid not in oracle or c.get("lang") == "en"):
+                faces = c.get("card_faces") or []
+                text = c.get("oracle_text")
+                if text is None and faces:
+                    text = "\n//\n".join(f.get("oracle_text", "") for f in faces)
+                front = faces[0] if faces else {}
+                oracle[oid] = (oid, c["name"], c.get("mana_cost") or front.get("mana_cost") or "", c.get("cmc") or 0.0,
+                               c.get("type_line") or " // ".join(f.get("type_line", "") for f in faces), text or "",
+                               json.dumps(c.get("keywords") or []), c.get("power") or front.get("power"),
+                               c.get("toughness") or front.get("toughness"), "".join(c.get("color_identity") or []),
+                               (c.get("legalities") or {}).get("commander"), int(bool(c.get("game_changer"))))
             # The scanner reads the name printed at the top of the card, which for
             # split / double-faced cards is just one face, so index every face name.
             names.add((c["name"], c["name"]))
@@ -106,8 +124,9 @@ def build():
                     names.add((alt, c["name"]))
     db.executemany("INSERT OR REPLACE INTO cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     db.executemany("INSERT INTO names VALUES (?,?)", sorted(names))
+    db.executemany("INSERT INTO oracle_cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", list(oracle.values()))
     db.executescript("CREATE INDEX idx_name ON cards(name); CREATE INDEX idx_set ON cards(set_code); "
-                     "CREATE INDEX idx_oracle ON cards(oracle_id);")
+                     "CREATE INDEX idx_oracle ON cards(oracle_id); CREATE INDEX idx_oracle_name ON oracle_cards(name);")
     db.commit()
     db.close()
     os.replace(tmp, DB_PATH)

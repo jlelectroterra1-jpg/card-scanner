@@ -115,8 +115,40 @@ def main(out):
         shot("16_duplicate_dialog.png")
         s.dialog = None
         s.pause_deck_scan()
+        # ---- analyse
+        for n in ("Beast Whisperer", "Guardian Project", "Path to Exile", "Toxic Deluge", "Inexorable Tide",
+                  "Three Visits", "Nature's Lore", "Smothering Tithe", "Heroic Intervention", "Fathom Mage"):
+            c = st.default_printing(n)
+            s.userdb.add_card(c["id"], c["name"], c["set_code"], c["collector_number"])
         s.switch_tab("analyse")
-        shot("17_analyse_placeholder.png")
+        a = s.analyse_screen
+        a.select_deck(deck)
+        shot("17_analyse_empty.png")
+        a.run()
+        import time
+        while a.running:
+            time.sleep(0.2)
+            a.poll()
+        a.tab = "overview"
+        a.bump()
+        shot("18_analyse_overview.png")
+        a.tab = "swaps"
+        a.bump()
+        shot("19_analyse_swaps.png")
+        a.confirm_apply()
+        shot("20_analyse_apply_dialog.png")
+        s.dialog = None
+        from analyse_view import TagDialog
+        s.open_dialog(TagDialog(a))
+        shot("21_analyse_tags.png")
+        s.dialog = None
+        s.userdb.save_analysis_profile(deck, mode="all", budget_usd=500 / 17.25)
+        a.check_stale()
+        a.bump()
+        shot("22_analyse_all_cards_stale.png")
+        a.tab = "combos"
+        a.bump()
+        shot("23_analyse_combos.png")
         s.userdb.close()
         print("rendered to", out)
     finally:

@@ -168,7 +168,7 @@ class Scanner:
             self.userdb = UserDB(USER_DB_PATH)
         except Exception as e:  # noqa: BLE001
             print(f"Couldn't open the collection database (data/user.db): {e}")
-        self.deck_store = self.decks_screen = None
+        self.deck_store = self.decks_screen = self.analyse_screen = None
         self._pending = None
         self._deck_stats = (None, None)
         if self.userdb is not None:
@@ -538,6 +538,12 @@ class Scanner:
                 self.decks_screen = DecksScreen(self, VIEW_W + PANEL_W, VIEW_H + FOOTER_H, store=self.deck_store)
             else:
                 self.decks_screen.refresh()
+        if tab == "analyse" and self.deck_store is not None:
+            if self.analyse_screen is None:
+                from analyse_view import AnalyseScreen
+                self.analyse_screen = AnalyseScreen(self, VIEW_W + PANEL_W, VIEW_H + FOOTER_H, store=self.deck_store)
+            else:
+                self.analyse_screen.refresh()
         self.tab = tab
 
     def draw_nav(self, width):
@@ -583,8 +589,10 @@ class Scanner:
             body = self.draw_placeholder(width, VIEW_H + FOOTER_H, "Collection unavailable (see the console)")
         elif self.tab == "decks" and self.decks_screen is not None:
             body, self._screen_hits = self.decks_screen.render()
+        elif self.tab == "analyse" and self.analyse_screen is not None:
+            body, self._screen_hits = self.analyse_screen.render()
         elif self.tab in ("decks", "analyse"):
-            body = self.draw_placeholder(width, VIEW_H + FOOTER_H, dict(TABS)[self.tab])
+            body = self.draw_placeholder(width, VIEW_H + FOOTER_H, dict(TABS)[self.tab] + " unavailable (see the console)")
         else:
             body = self.draw(frame)
         canvas = np.vstack([self.draw_nav(width), body])
@@ -1048,6 +1056,12 @@ class Scanner:
             elif event == cv2.EVENT_MOUSEWHEEL:
                 self.decks_screen.wheel(cv2.getMouseWheelDelta(flags))
             return
+        if self.tab == "analyse" and self.analyse_screen is not None:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.analyse_screen.click(x, y, self._screen_hits)
+            elif event == cv2.EVENT_MOUSEWHEEL:
+                self.analyse_screen.wheel(cv2.getMouseWheelDelta(flags))
+            return
         if self.tab != "scanner":
             return
         self.on_scanner_mouse(event, x, y, flags)
@@ -1096,6 +1110,10 @@ class Scanner:
         if self.tab == "decks":
             if self.decks_screen is not None:
                 self.decks_screen.key(key)
+            return True
+        if self.tab == "analyse":
+            if self.analyse_screen is not None:
+                self.analyse_screen.key(key)
             return True
         if self.tab != "scanner":
             return True
