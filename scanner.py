@@ -67,6 +67,28 @@ def save_json(path, data):
     os.replace(path + ".part", path)
 
 
+DEBUG_DIR = os.path.join(HERE, "data", "debug")
+
+
+def save_debug(zone_img, card_img, res):
+    """Keep what each scan saw (last 200), so recognition can be tuned on real cards."""
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        cv2.imwrite(os.path.join(DEBUG_DIR, f"{stamp}_zone.jpg"), zone_img)
+        cv2.imwrite(os.path.join(DEBUG_DIR, f"{stamp}_card.jpg"), res.get("card", card_img))
+        info = dict(name_text=res.get("name_text"), how=res.get("how"), confident=res.get("confident"),
+                    candidates=res.get("candidates", [])[:5], secs=round(res.get("secs", 0), 2),
+                    added=(res.get("printings") or [{}])[0].get("name") if res.get("confident") else None)
+        with open(os.path.join(DEBUG_DIR, f"{stamp}.json"), "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=1)
+        files = sorted(os.listdir(DEBUG_DIR))
+        for old in files[:-600]:
+            os.remove(os.path.join(DEBUG_DIR, old))
+    except OSError:
+        pass
+
+
 def beep(ok=True):
     def run():
         try:
@@ -208,6 +230,7 @@ class Scanner:
             except Exception as e:  # never let one bad frame kill the scanner
                 res = dict(candidates=[], printings=[], confident=False, name_text=f"error: {e}", card=card)
             res["secs"] = time.time() - t
+            save_debug(z, card, res)
             self.results.put(res)
 
         threading.Thread(target=work, daemon=True).start()
