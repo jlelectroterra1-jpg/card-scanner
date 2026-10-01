@@ -26,9 +26,14 @@ def signature(card_bgr):
     return (lab - mean) / std
 
 
-def _fetch(card):
+_sig_cache = {}
+
+
+def _fetch(card, download=True):
+    if card["id"] in _sig_cache:
+        return _sig_cache[card["id"]]
     path = os.path.join(IMG_DIR, card["id"] + ".jpg")
-    if not os.path.exists(path) and card.get("image_small"):
+    if download and not os.path.exists(path) and card.get("image_small"):
         try:
             data = _session.get(card["image_small"], timeout=20).content
             with open(path + ".part", "wb") as f:
@@ -37,19 +42,25 @@ def _fetch(card):
         except (requests.RequestException, OSError):
             return None
     img = cv2.imread(path) if os.path.exists(path) else None
-    return None if img is None else signature(img)
+    sig = None if img is None else signature(img)
+    if sig is not None:
+        _sig_cache[card["id"]] = sig
+    return sig
 
 
-def reference_signatures(printings):
+def reference_signatures(printings, download=True):
     os.makedirs(IMG_DIR, exist_ok=True)
+    if not download:
+        return [_fetch(p, False) for p in printings]
     return list(_pool.map(_fetch, printings))
 
 
-def rank_printings(card_bgr, printings):
-    """Returns printings sorted by visual similarity, each with a 'dist' key (lower = closer)."""
+def rank_printings(card_bgr, printings, download=True):
+    """Returns printings sorted by visual similarity, each with a 'dist' key (lower = closer).
+    With download=False, printings whose image isn't cached locally sort last."""
     sig = signature(card_bgr)
     out = []
-    for p, ref in zip(printings, reference_signatures(printings)):
+    for p, ref in zip(printings, reference_signatures(printings, download)):
         dist = float(np.abs(sig - ref).mean()) if ref is not None else 9.0
         out.append(dict(p, dist=dist))
     return sorted(out, key=lambda p: p["dist"])

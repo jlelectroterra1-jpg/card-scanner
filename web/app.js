@@ -1,5 +1,6 @@
 import { initNames, matchName } from "./match.js";
-import { initVision, findCard, readName, rankPrintings, CARD_W, CARD_H } from "./vision.js";
+import { initVision, findCard, readName, rankPrintings, CARD_W, CARD_H,
+  initPicture, recognisePicture, pictureReady } from "./vision.js";
 
 const OPENCV_URL = "https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.12.0-release.1/dist/opencv.js";
 const ORT_WASM = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
@@ -33,8 +34,8 @@ const state = {
 
 // ---------------------------------------------------------------- loading
 
-const loadSteps = { opencv: 0, ort: 0, model: 0, names: 0 };
-const loadWeights = { opencv: 0.35, ort: 0.3, model: 0.3, names: 0.05 };
+const loadSteps = { opencv: 0, ort: 0, model: 0, names: 0, picture: 0 };
+const loadWeights = { opencv: 0.2, ort: 0.15, model: 0.15, names: 0.05, picture: 0.45 };
 function progress(step, frac) {
   loadSteps[step] = frac;
   const total = Object.keys(loadSteps).reduce((s, k) => s + loadSteps[k] * loadWeights[k], 0);
@@ -83,15 +84,28 @@ async function boot() {
   try {
     ort.env.wasm.wasmPaths = ORT_WASM;
     ort.env.wasm.numThreads = 1; // GitHub Pages can't enable cross-origin isolation for threads
-    $("load-text").textContent = "Downloading card reader (first time ~15 MB)…";
+    $("load-text").textContent = "Downloading card recogniser (first time ~45 MB, then it's saved)…";
     const namesP = fetchWithProgress("data/names.json", "names", "json");
     const dictP = fetch("models/en_dict.json").then(r => r.json());
     const modelP = fetchWithProgress("models/en_rec.onnx", "model");
     const cvP = loadOpenCV();
+    // Picture recognition: model + compressed fingerprints of every card artwork.
+    const picP = Promise.all([
+      fetchWithProgress("models/card_embed.onnx", "picture"),
+      fetch("data/art_index.bin").then(r => r.arrayBuffer()),
+      fetch("data/art_proj.bin").then(r => r.arrayBuffer()),
+      fetch("data/art_meta.json").then(r => r.json()),
+    ]);
     initNames(await namesP);
     const ortTick = setInterval(() => progress("ort", Math.min(0.95, loadSteps.ort + 0.05)), 250);
     await initVision((await cvP).cv, ort, new Uint8Array(await modelP), await dictP);
     clearInterval(ortTick); progress("ort", 1);
+    try {
+      const [model, index, proj, meta] = await picP;
+      await initPicture(new Uint8Array(model), index, proj, meta);
+    } catch (e) {
+      console.error("picture recognition unavailable", e); // still works by reading names
+    }
     state.ready = true;
     $("load-text").textContent = "Ready.";
     $("start-btn").disabled = false;
@@ -236,7 +250,12 @@ async function scanPhoto(file) {
   if ($("scan").classList.contains("hidden")) showScanner();
   state.busy = true;
   try {
-    const card = findCard(c) || c;
+    const card = findCard(c);
+    if (!card) {
+      status("Couldn't find a card in that photo — try again closer, on a plain background", "bad");
+      beep(false);
+      return;
+    }
     await identify(card, false);
   } finally {
     state.busy = false;
@@ -245,7 +264,30 @@ async function scanPhoto(file) {
 
 async function identify(card, auto) {
   status("Reading…");
+  // Picture first: recognises the artwork even when the name is too small to read.
+  let pic = null;
+  if (pictureReady()) {
+    pic = await recognisePicture(card);
+    if (pic.sure) {
+      state.unsure = 0;
+      state.lastHow = "picture";
+      await addByName(pic.hits[0].name, pic.card, pic.hits[0].id);
+      return "added";
+    }
+  }
   const res = await readName(card, matchName);
+  if (pic && pic.hits.length) {
+    const picNames = pic.hits.map(h => h.name);
+    if (res.candidates[0] && res.candidates[0][0] === picNames[0] && res.candidates[0][1] >= 60) {
+      res.confident = true; // name and picture agree
+    } else if (!res.confident) {
+      // Offer the best of both: names the picture also suggests go first.
+      const merged = new Map();
+      res.candidates.forEach(([n, sc]) => merged.set(n, sc + (picNames.includes(n) ? 20 : 0)));
+      pic.hits.forEach((h, i) => merged.set(h.name, Math.max(merged.get(h.name) || 0, 90 - 8 * i)));
+      res.candidates = [...merged].sort((a, b) => b[1] - a[1]).slice(0, 5);
+    }
+  }
   if (!res.candidates.length) {
     if (!auto) status(`Couldn't read the name${res.text ? ` (“${res.text}”)` : ""} — try again`, "bad");
     else status("");
@@ -255,6 +297,7 @@ async function identify(card, auto) {
   }
   if (res.confident) {
     state.unsure = 0;
+    state.lastHow = "name";
     await addByName(res.candidates[0][0], res.card);
     return "added";
   }
@@ -266,7 +309,7 @@ async function identify(card, auto) {
   return "asked";
 }
 
-async function addByName(name, cardCanvas) {
+async function addByName(name, cardCanvas, preferId = null) {
   status(`Finding ${name}…`);
   let prints = await fetchPrintings(name);
   if (!prints.length) { status(`Couldn't load ${name} from Scryfall`, "bad"); beep(false); return; }
@@ -275,7 +318,7 @@ async function addByName(name, cardCanvas) {
     const inSet = prints.filter(p => p.set === lock);
     if (inSet.length) prints = inSet;
   }
-  if (cardCanvas) prints = await rankPrintings(cardCanvas, prints);
+  if (cardCanvas) prints = await rankPrintings(cardCanvas, prints, 40, preferId);
   const p = prints[0];
   const finish = pickFinish(p, state.settings.defaultFoil ? "foil" : "nonfoil");
   state.entries.push({ ...p, finish, t: Date.now() });

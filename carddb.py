@@ -59,20 +59,14 @@ class CardDB:
         ranked = self.ranked_printings(name, footer_text, locked_set, card_img)
         return ranked[0] if ranked else None
 
-    def printings_for_art(self, name, art_id, locked_set=None):
-        """Printings of `name` with the recognised artwork's printing first, then
-        regular printings over promos / The List, newest first. No image downloads."""
-        prints = [p for p in self.printings(name) if p["lang"] == "en"] or self.printings(name)
-        if locked_set:
-            in_set = [p for p in prints if p["set_code"] == locked_set]
-            if in_set:
-                return in_set + [p for p in prints if p["set_code"] != locked_set]
-        regular = lambda p: not p["promo"] and p["set_code"] != "plst"
-        first = [p for p in prints if p["id"] == art_id]
-        rest = sorted((p for p in prints if p["id"] != art_id), key=lambda p: not regular(p))
-        return first + rest
+    def printings_for_art(self, name, art_id, locked_set=None, footer_text="", card_img=None):
+        """Printings of `name`, most likely first, without downloading anything:
+        the same frame/colours as the photo (vs locally cached images), then the set
+        code / number read from the corner, then the recognised artwork, then
+        regular printings over promos, then newest."""
+        return self.ranked_printings(name, footer_text, locked_set, card_img, prefer_id=art_id, download=False)
 
-    def ranked_printings(self, name, footer_text="", locked_set=None, card_img=None):
+    def ranked_printings(self, name, footer_text="", locked_set=None, card_img=None, prefer_id=None, download=True):
         """All printings of `name`, most likely first: by how it looks (compared
         with Scryfall's images), then the set code / collector number read from
         the bottom-left corner, then the regular printing over promos, then newest."""
@@ -97,13 +91,15 @@ class CardDB:
                 s += 3
             if not p["promo"] and p["set_code"] != "plst":
                 s += 0.5
+            if p["id"] == prefer_id:
+                s += 0.75
             return s
 
         if card_img is None or len(prints) == 1:
             # sorted() is stable, so ties keep the newest-first order from printings().
             return sorted(prints, key=footer_score, reverse=True)
         from printmatch import rank_printings
-        ranked = rank_printings(card_img, prints)
+        ranked = rank_printings(card_img, prints, download=download)
         # Reprints with the same art and frame look identical to a webcam,
         # so treat everything close to the best match as a tie.
         cutoff = ranked[0]["dist"] * 1.10 + 0.02

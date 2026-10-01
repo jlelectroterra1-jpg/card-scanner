@@ -29,15 +29,25 @@ export function findCard(srcCanvas) {
     cv.Canny(gray, edges, 40, 120);
     cv.dilate(edges, edges, kernel);
     cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    let best = null, bestArea = 0;
+    // Take the biggest outline that is actually card-shaped, so a card held far
+    // away (small in the picture) is still found but a random blob isn't.
+    const minArea = 0.025 * src.cols * src.rows;
+    const outlines = [];
     for (let i = 0; i < contours.size(); i++) {
       const c = contours.get(i);
       const a = cv.contourArea(c);
-      if (a > bestArea) { bestArea = a; best?.delete(); best = c; } else c.delete();
+      if (a >= minArea) outlines.push({ a, rect: cv.minAreaRect(c) });
+      c.delete();
     }
-    if (!best || bestArea < 0.12 * src.cols * src.rows) { best?.delete(); return null; }
-    const rect = cv.minAreaRect(best);
-    best.delete();
+    outlines.sort((x, y) => y.a - x.a);
+    const found = outlines.find(({ a, rect: r }) => {
+      const rw = r.size.width, rh = r.size.height;
+      if (rw * rh <= 0) return false;
+      const aspect = Math.min(rw, rh) / Math.max(rw, rh);
+      return aspect >= 0.6 && aspect <= 0.85 && a / (rw * rh) > 0.75;
+    });
+    if (!found) return null;
+    const rect = found.rect;
     let [tl, tr, br, bl] = orderCorners(boxPoints(rect));
     if (dist(tl, tr) > dist(tl, bl)) [tl, tr, br, bl] = [tr, br, bl, tl]; // sideways -> portrait
     const from = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y]);
@@ -180,7 +190,7 @@ async function referenceSignature(p) {
 
 // Sort printings by how much they look like the scanned card. Reprints with the
 // same art and frame look identical, so near-ties keep the regular printing first.
-export async function rankPrintings(card, printings, maxCompare = 40) {
+export async function rankPrintings(card, printings, maxCompare = 40, preferId = null) {
   if (printings.length < 2) return printings;
   const mine = signatureOf(card);
   const head = printings.slice(0, maxCompare);
@@ -196,8 +206,89 @@ export async function rankPrintings(card, printings, maxCompare = 40) {
   });
   scored.sort((a, b) => a.d - b.d);
   const cutoff = scored[0].d * 1.1 + 0.02;
-  const regular = p => (!p.promo && p.set !== "plst" ? 1 : 0);
+  // Within look-alikes: the artwork the picture model recognised, then regular printings.
+  const regular = p => (p.id === preferId ? 2 : 0) + (!p.promo && p.set !== "plst" ? 1 : 0);
   const close = scored.filter(s => s.d <= cutoff).sort((a, b) => regular(b.p) - regular(a.p) || a.i - b.i);
   const rest = scored.filter(s => s.d > cutoff);
   return [...close, ...rest].map(s => s.p).concat(printings.slice(maxCompare));
+}
+
+// ---- picture recognition (model trained on webcam-like shots; see train_model.py) ----
+
+const PIC_W = 128, PIC_H = 176;
+const PIC_MEAN = [0.485, 0.456, 0.406], PIC_STD = [0.229, 0.224, 0.225];
+export const PICTURE_SURE_GAP = 0.08;
+let picSession = null, artIndex = null, artProj = null, artMeta = null;
+
+export async function initPicture(modelBytes, indexBuf, projBuf, meta) {
+  picSession = await ort.InferenceSession.create(modelBytes, { executionProviders: ["wasm"] });
+  artIndex = new Int8Array(indexBuf);
+  artProj = new Float32Array(projBuf);
+  artMeta = meta;
+}
+
+export const pictureReady = () => !!picSession;
+
+async function embed(card) {
+  const c = document.createElement("canvas");
+  c.width = PIC_W; c.height = PIC_H;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.imageSmoothingQuality = "high";
+  g.drawImage(card, 0, 0, PIC_W, PIC_H);
+  const px = g.getImageData(0, 0, PIC_W, PIC_H).data, plane = PIC_W * PIC_H;
+  const x = new Float32Array(3 * plane);
+  for (let i = 0; i < plane; i++) {
+    for (let ch = 0; ch < 3; ch++) x[ch * plane + i] = (px[i * 4 + ch] / 255 - PIC_MEAN[ch]) / PIC_STD[ch];
+  }
+  const out = await picSession.run({ image: new ort.Tensor("float32", x, [1, 3, PIC_H, PIC_W]) });
+  const e = out.embedding.data;                       // 512 numbers
+  const D = artMeta.dims, q = new Float32Array(D);   // compress to D like the index
+  for (let j = 0; j < D; j++) {
+    let s = 0;
+    for (let i = 0; i < e.length; i++) s += e[i] * artProj[i * D + j];
+    q[j] = s;
+  }
+  let n = 0;
+  for (let j = 0; j < D; j++) n += q[j] * q[j];
+  n = Math.sqrt(n) || 1;
+  for (let j = 0; j < D; j++) q[j] /= n;
+  return q;
+}
+
+// Returns { hits: [{name, id, score}] (5 different names, best first), gap }.
+async function searchPicture(card) {
+  const q = await embed(card), D = artMeta.dims, N = artMeta.count;
+  const top = []; // [score, row], best 60
+  for (let r = 0; r < N; r++) {
+    let s = 0;
+    const o = r * D;
+    for (let j = 0; j < D; j++) s += artIndex[o + j] * q[j];
+    s /= 127;
+    if (top.length < 60 || s > top[top.length - 1][0]) {
+      top.push([s, r]);
+      top.sort((a, b) => b[0] - a[0]);
+      if (top.length > 60) top.pop();
+    }
+  }
+  const hits = [], seen = new Set();
+  for (const [score, r] of top) {
+    const name = artMeta.names[artMeta.name_of[r]];
+    if (seen.has(name)) continue;
+    seen.add(name);
+    hits.push({ name, id: artMeta.ids[r], score });
+    if (hits.length === 5) break;
+  }
+  return { hits, gap: hits.length > 1 ? hits[0].score - hits[1].score : 0 };
+}
+
+// Try the card both ways up; returns the more confident result plus the canvas used.
+export async function recognisePicture(card) {
+  let best = { ...(await searchPicture(card)), card };
+  if (best.gap < PICTURE_SURE_GAP) {
+    const flipped = rotate180(card);
+    const r = await searchPicture(flipped);
+    if (r.hits[0] && r.hits[0].score > best.hits[0].score) best = { ...r, card: flipped };
+  }
+  best.sure = best.gap >= PICTURE_SURE_GAP;
+  return best;
 }

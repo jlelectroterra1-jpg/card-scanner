@@ -42,9 +42,28 @@ class Recognizer:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
-        c = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(c) < 0.12 * w * h:
-            return None
+        if background_bgr is None:
+            # Edges alone: take the biggest outline that is actually card-shaped, so a
+            # card held far away (small in the picture) is still found, but a random
+            # blob isn't mistaken for one.
+            c = None
+            for cand in sorted(contours, key=cv2.contourArea, reverse=True):
+                area = cv2.contourArea(cand)
+                if area < 0.025 * w * h:
+                    break
+                (_, _), (rw, rh), _ = cv2.minAreaRect(cand)
+                if rw * rh <= 0:
+                    continue
+                aspect = min(rw, rh) / max(rw, rh)
+                if 0.6 <= aspect <= 0.85 and area / (rw * rh) > 0.75:
+                    c = cand
+                    break
+            if c is None:
+                return None
+        else:
+            c = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(c) < 0.05 * w * h:
+                return None
         if background_bgr is not None and cv2.contourArea(c) > 0.85 * w * h:
             # Nearly the whole box "changed": the light changed, not just a card
             # arriving. Find the card by its edges instead.
@@ -78,8 +97,11 @@ class Recognizer:
             vis = self.visual.query(img, k=5)
             if len(vis) > 1 and vis[0][2] - vis[1][2] >= sure_gap:
                 name, art_id = vis[0][0], vis[0][1]
-                return dict(name_text="", footer_text="", candidates=[(n, 100 * max(0.0, sc)) for n, _, sc in vis],
-                            printings=self.db.printings_for_art(name, art_id, locked_set),
+                # Reprints share artwork; on a close card the set code / number in the
+                # bottom-left corner tells them apart (~20 ms; junk from far away is ignored).
+                footer = " ".join(self.read_line(img, b, height=40) for b in FOOTER_LINES)
+                return dict(name_text="", footer_text=footer, candidates=[(n, 100 * max(0.0, sc)) for n, _, sc in vis],
+                            printings=self.db.printings_for_art(name, art_id, locked_set, footer, img),
                             confident=True, card=img, how="picture")
         return None
 

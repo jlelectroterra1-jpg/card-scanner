@@ -80,7 +80,18 @@ def download_images(cards, workers=12):
         list(pool.map(fetch, todo))
 
 
+def all_printings():
+    """Every English paper printing in cards.db, for telling reprints/frames apart."""
+    import sqlite3
+    db = sqlite3.connect(os.path.join(DATA, "cards.db"))
+    rows = db.execute("SELECT id, name, image_small FROM cards WHERE image_small IS NOT NULL AND lang = 'en'")
+    return [dict(id=r[0], name=r[1], img=r[2]) for r in rows]
+
+
 if __name__ == "__main__":
+    if "--all-printings" in sys.argv:
+        download_images(all_printings())
+        sys.exit()
     cards = artwork_list(refresh="--refresh" in sys.argv)
     download_images(cards)
     if "--download-only" not in sys.argv:

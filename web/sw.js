@@ -1,7 +1,8 @@
 // Offline cache: big, versioned files (CDN libraries, OCR model) are cache-first;
 // the app's own files are network-first so updates show up straight away.
-const CACHE = "card-scanner-v1";
-const IMMUTABLE = [/cdn\.jsdelivr\.net\/npm\/.+@\d/, /\/models\//, /\/data\/names\.json$/];
+const CACHE = "card-scanner-v2";
+// Bump CACHE when models/ or data/ change so phones fetch the new files once.
+const IMMUTABLE = [/cdn\.jsdelivr\.net\/npm\/.+@\d/, /\/models\//, /\/data\//];
 
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", e => e.waitUntil(
