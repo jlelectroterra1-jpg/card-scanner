@@ -208,7 +208,7 @@ class Scanner:
         if present and self.still >= STILL_FRAMES and not self.busy and self.review is None:
             self.start_scan(frame)
 
-    def start_scan(self, frame):
+    def start_scan(self, frame, manual=False):
         self.busy = True
         self.armed = False
         z = self.zone_crop(frame).copy()
@@ -222,8 +222,13 @@ class Scanner:
             card = self.rec.find_card(z, bg)
             if card is None:
                 card = self.rec.find_card(z, None)
-            if card is None:  # assume the zone is drawn snugly around the card
-                card = cv2.resize(z, (630, 880))
+            if card is None:
+                if not manual:
+                    # Nothing card-shaped (empty playmat, a hand): don't guess.
+                    self.results.put(dict(candidates=[], printings=[], confident=False, name_text="",
+                                          card=None, no_card=True))
+                    return
+                card = cv2.resize(z, (630, 880))  # SPACE pressed: assume the box is snug around the card
             try:
                 res = self.rec.identify(card, locked)
             except Exception as e:  # never let one bad frame kill the scanner
@@ -238,6 +243,9 @@ class Scanner:
 
     def handle_result(self, res):
         self.busy = False
+        if res.get("no_card"):
+            self.set_status("Ready", WHITE)
+            return
         if res["confident"] and res["printings"]:
             self.add_card(res["printings"], res["card"])
             beep(True)
@@ -481,7 +489,7 @@ class Scanner:
         if ch == "b" and self.zone and self.last_frame is not None:
             self.capture_background(self.last_frame)
         elif key == 32 and self.zone and self.last_frame is not None and not self.busy:
-            self.start_scan(self.last_frame)
+            self.start_scan(self.last_frame, manual=True)
         elif ch == "f":
             self.cycle_finish()
         elif ch == "]":
