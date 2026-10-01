@@ -208,6 +208,43 @@ class Panel:
         self._button(d, (bx, y, self.W - p, y + 34), f"Add {pending} to Collection" if pending else "Add to Collection",
                      "add_collection", buttons, primary=bool(pending))
 
+    def _deck_header(self, d, v):
+        """Scan Deck / Scan Commander mode: what we're scanning into, and progress."""
+        dm = v["deck_mode"]
+        p = 16
+        if dm["kind"] == "commander":
+            self._chip(d, p, 10, "SCAN THE " + ("PARTNER" if dm.get("partner") else "COMMANDER"), YELLOW)
+            d.text((p, 38), self._fit(dm["name"], self.f["name"], self.W - 2 * p), font=self.f["name"], fill=TEXT)
+            d.text((p, 64), "Put the commander in the box", font=self.f["small"], fill=MUTED)
+            d.line((p, 84, self.W - p, 84), fill=BUTTON, width=1)
+            return
+        x = self._chip(d, p, 8, "SCANNING DECK", YELLOW)
+        d.text((x + 4, 18), self._fit(dm["name"], self.f["button"], self.W - x - 20), font=self.f["button"],
+               fill=TEXT, anchor="lm")
+        n, size = dm["count"], dm["size"]
+        if n == size:
+            text, colour = f"{n} / {size}  complete", GREEN
+        elif n > size:
+            text, colour = f"{n} / {size}  too many", YELLOW
+        else:
+            text, colour = f"{n} / {size}", TEXT
+        d.text((p, 34), text, font=self.f["big"], fill=colour)
+        d.text((self.W - p, 34), _money(v, dm["value"]), font=self.f["big"], fill=TEXT, anchor="ra")
+        d.text((p, 68), self._fit(f"Commander: {dm['commander']}  -  {dm['unique']} unique", self.f["small"],
+                                  self.W - 2 * p), font=self.f["small"], fill=MUTED)
+        d.line((p, 86, self.W - p, 86), fill=BUTTON, width=1)
+
+    def _deck_footer(self, d, buttons, v):
+        dm = v["deck_mode"]
+        p = 16
+        y = self.H - 90
+        if dm["kind"] == "commander":
+            self._button(d, (p, y, self.W - p, y + 34), "Cancel", "cancel_commander", buttons)
+            return
+        half = (self.W - 2 * p - 6) * 0.62
+        self._button(d, (p, y, p + half, y + 34), "Finish scan", "finish_deck", buttons, primary=True)
+        self._button(d, (p + half + 6, y, self.W - p, y + 34), "Pause", "pause_deck", buttons)
+
     def _footer_buttons(self, d, buttons):
         p, gap = 16, 6
         y = self.H - 46
@@ -301,7 +338,10 @@ class Panel:
         img = Image.new("RGB", (self.W, self.H), BG)
         d = ImageDraw.Draw(img)
         buttons = []
-        self._header(d, view)
+        if view.get("deck_mode"):
+            self._deck_header(d, view)
+        else:
+            self._header(d, view)
         top = 90
         if view.get("bg_menu"):
             self._background_menu(img, d, view, buttons, top)
@@ -311,8 +351,11 @@ class Panel:
             self._review(img, d, view, buttons, top)
         else:
             y = self._last_card(img, d, view, buttons, top)
-            self._recent(img, d, view, y + 4, self.H - 96 if view.get("show_destination") else self.H - 56)
-            if view.get("show_destination"):
+            footer_row = view.get("show_destination") or view.get("deck_mode")
+            self._recent(img, d, view, y + 4, self.H - 96 if footer_row else self.H - 56)
+            if view.get("deck_mode"):
+                self._deck_footer(d, buttons, view)
+            elif view.get("show_destination"):
                 self._view = view
                 self._destination(d, buttons)
         self._footer_buttons(d, buttons)

@@ -32,8 +32,8 @@ sees). Relearn after moving the camera, changing playmat or big lighting changes
 **K** clears it. Drawing a new scan box learns a new background for it automatically.
 
 ## Tabs: Scanner | Collection | Decks | Analyse
-Click the tabs at the top (or F1-F4). Auto-scan only runs on the Scanner tab. Decks and
-Analyse are placeholders for later phases.
+Click the tabs at the top (or F1-F4). Auto-scan only runs on the Scanner tab. Analyse is a
+placeholder for a later phase.
 
 **Scanned cards -> collection.** The side panel shows **To: <collection>** (click it to pick
 another, once you have more than one) and **Add N to Collection** (or press **A**). All
@@ -54,6 +54,26 @@ can't be deleted; deleting one with cards asks whether to move them or delete th
 (run **Update Prices.bat** first for fresh prices). **Export** writes a ManaBox CSV and a
 plain list. **Import CSV** reads a ManaBox CSV, shows a preview (matched by Scryfall ID, by
 set + number, or name only) and only adds name-only matches if you tick them.
+
+**Decks tab (Commander).** New Deck -> name + format -> choose the commander (search, or
+put it under the camera: "Set X as commander?"). **Scan Deck** switches the Scanner into
+deck mode ("SCANNING DECK", e.g. 37 / 100): feed the whole deck through - same camera,
+background, recognition and printing/foil handling as always, but the cards go into that
+deck's own session (`data/deck_scan.json`, saved after every card; if the app closes you're
+asked to resume). A second copy of a non-basic card asks Keep anyway / Remove duplicate /
+Undo last scan (basic lands are fine). **Finish scan** puts the cards in the deck, links each
+one to a FREE copy in your Collection (exact printing+finish first, then same printing,
+then any printing - never a copy another deck uses) and offers to add the rest to your
+Collection. **Pause** keeps the session for later.
+The deck view groups cards by type (or All A-Z, by name or price) with ownership per card
+(owned exact / other printing, deck only, not owned, used in another deck), colour
+identity, warnings (count, colour identity, Commander legality, duplicates - never
+changed automatically), value and most valuable cards. Click a card to change quantity,
+finish, printing, make it commander/partner, link/unlink a collection copy or remove it.
+Add Card searches by name and printing. More: rename, duplicate (the copy only uses free
+copies), import (plain/Moxfield/Archidekt/ManaBox text or CSV, with a preview), export
+(decklist + CSV), link owned copies, delete (confirmation; Collection cards stay, their
+copies become free).
 
 **USD / ZAR.** Top right: switch the display currency and set the rate (1 USD = R...).
 Prices are always stored in USD; ZAR is only how they're shown.
@@ -112,8 +132,9 @@ Prices are Scryfall's USD market prices.
 - `printmatch.py` compares the photo with Scryfall's image of every printing to pick the
   exact one (images are cached in `data/img`).
 
-Tests: `python -m unittest tests.test_collection tests.test_background tests.test_userdb`
-(collection, background, database - 52 tests, includes a 50,000-card speed test),
+Tests: `python -m unittest tests.test_decks tests.test_deck_workflow tests.test_collection tests.test_background tests.test_userdb`
+(decks incl. a full scan-a-deck workflow, collection, background, database - 71 tests, includes
+a 50,000-card speed test),
 `python tests/render_ui.py` (renders the screens to tests/ui_shots for a visual check),
 `python tests/check_far_pipeline.py` (far-away scans end to end),
 `python tests/test_synthetic.py 100` (name reading), `python tests/test_visual.py 200`

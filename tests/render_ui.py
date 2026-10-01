@@ -70,8 +70,53 @@ def main(out):
         c.manage()
         shot("8_manage_dialog.png")
         s.dialog = None
+        # ---- decks
+        st = s.deck_store
+        deck = st.create_deck("Atraxa Superfriends")
+        lines = ["Commander", "1 Atraxa, Praetors' Voice", "", "Deck"] + [
+            f"1 {n}" for n in ["Sol Ring", "Arcane Signet", "Command Tower", "Rhystic Study", "Smothering Tithe",
+                               "Swords to Plowshares", "Counterspell", "Lightning Bolt", "Mana Crypt", "Doubling Season",
+                               "Deepglow Skate", "Teferi, Hero of Dominaria", "Oko, Thief of Crowns",
+                               "Cyclonic Rift", "Demonic Tutor", "Birds of Paradise", "Exotic Orchard",
+                               "Breeding Pool", "Godless Shrine"]] + ["8 Island", "8 Plains"]
+        text = "\n".join(lines)
+        st.commit_import(deck, st.parse_decklist(text))
+        st.create_deck("Muldrotha Graveyard")
         s.switch_tab("decks")
-        shot("9_decks_placeholder.png")
+        shot("9_decks_list.png")
+        s.decks_screen.open_deck(deck)
+        shot("10_deck_view.png")
+        sol = next(r for r in s.decks_screen.rows if r["card_name"] == "Sol Ring")
+        s.decks_screen.selected = sol["id"]
+        s.decks_screen.bump()
+        shot("11_deck_card_detail.png")
+        s.decks_screen.selected = None
+        s.decks_screen.open_dd = "more"
+        s.decks_screen.bump()
+        shot("12_deck_more_menu.png")
+        s.decks_screen.open_dd = None
+        from decks_view import CardPicker
+        picker = CardPicker(s.decks_screen, "Add a card", lambda c, f: None)
+        for ch in "rhyst":
+            picker.key(ord(ch))
+        s.open_dialog(picker)
+        shot("13_card_picker.png")
+        picker.choose_name("Sol Ring")
+        shot("14_card_picker_printings.png")
+        s.dialog = None
+        s.start_deck_scan(deck)
+        for name in ("Sol Ring", "Command Tower", "Swords to Plowshares"):
+            c = st.default_printing(name)
+            s.target.add(s, dict(id=c["id"], finish="nonfoil", alts=[c["id"]], alt_idx=0, how="picture"), c)
+        shot("15_scanner_deck_mode.png")
+        c = st.default_printing("Sol Ring")
+        entry = dict(id=c["id"], finish="nonfoil", alts=[c["id"]], alt_idx=0, how="picture")
+        s.ask_duplicate(s.target.add(s, entry, c), entry)
+        shot("16_duplicate_dialog.png")
+        s.dialog = None
+        s.pause_deck_scan()
+        s.switch_tab("analyse")
+        shot("17_analyse_placeholder.png")
         s.userdb.close()
         print("rendered to", out)
     finally:

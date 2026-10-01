@@ -20,6 +20,7 @@ import numpy as np
 
 from carddb import CardDB
 from currency import display_currency, money as format_money, parse_rate
+from deckscan import CommanderPickTarget, DeckScanTarget, SessionTarget
 from panel import Panel
 from printmatch import IMG_DIR
 from recognizer import Recognizer, looks_empty
@@ -30,6 +31,7 @@ SESSION_PATH = os.path.join(HERE, "data", "session.json")
 EXPORT_DIR = os.path.join(HERE, "exports")
 BACKGROUND_DIR = os.path.join(HERE, "data", "backgrounds")  # learned empty-box photos, one per camera
 USER_DB_PATH = os.path.join(HERE, "data", "user.db")  # permanent collection/deck database (userdb.py)
+DECK_SCAN_PATH = os.path.join(HERE, "data", "deck_scan.json")  # unfinished Scan Deck session
 
 VIEW_W, VIEW_H = 960, 540  # camera preview size on screen
 PANEL_W = 440
@@ -127,7 +129,10 @@ class Scanner:
         self.settings = load_json(SETTINGS_PATH, {})
         if args.camera is not None:
             self.settings["camera"] = args.camera
-        self.entries = load_json(SESSION_PATH, [])  # one dict per physical card scanned
+        # Recognised cards go to the active scan target (deckscan.py): the normal scan list,
+        # a deck being scanned, or a commander being picked.
+        self.normal_target = SessionTarget(SESSION_PATH)
+        self.target = self.normal_target
         self.cap = None
         self.open_camera(self.settings.get("camera", 0))
 
@@ -163,6 +168,26 @@ class Scanner:
             self.userdb = UserDB(USER_DB_PATH)
         except Exception as e:  # noqa: BLE001
             print(f"Couldn't open the collection database (data/user.db): {e}")
+        self.deck_store = self.decks_screen = None
+        self._pending = None
+        self._deck_stats = (None, None)
+        if self.userdb is not None:
+            try:
+                from decks import DeckStore
+                self.deck_store = DeckStore(self.userdb)
+                self._pending = DeckScanTarget.load(DECK_SCAN_PATH)
+                self.offer_resume()
+            except Exception as e:  # noqa: BLE001
+                print(f"Decks unavailable: {e}")
+
+    # The current scan list: the normal session, or the deck being scanned.
+    @property
+    def entries(self):
+        return self.target.entries
+
+    @entries.setter
+    def entries(self, value):
+        self.target.entries = value
 
     # ---- app services (dialogs, messages, currency) ------------------------
 
@@ -241,7 +266,7 @@ class Scanner:
         return next((c["name"] for c in self.userdb.collections() if c["id"] == cid), "Main Collection")
 
     def pending_entries(self):
-        return [e for e in self.entries if not e.get("in_collection")]
+        return [e for e in self.normal_target.entries if not e.get("in_collection")]
 
     def choose_destination(self):
         from ui import Dialog
@@ -263,6 +288,9 @@ class Scanner:
         from ui import Dialog
         if self.userdb is None:
             self.set_status("The collection database isn't available", RED)
+            return
+        if self.target is not self.normal_target:
+            self.set_status("Finish or pause the deck scan first", YELLOW)
             return
         pending = self.pending_entries()
         if not pending:
@@ -291,6 +319,210 @@ class Scanner:
         self.open_dialog(Dialog(msg, "Clear the scan list now? (A copy is saved to exports first.)",
                                 buttons=[("Keep list", False, "normal"), ("Clear list", True, "primary")], on_done=done))
 
+    # ---- deck scanning ------------------------------------------------------------
+
+    def pending_deck_scan(self):
+        """The unfinished deck scan: dict(deck_id, deck_name, entries) or None."""
+        if self.target.kind == "deck":
+            return dict(deck_id=self.target.deck_id, deck_name=self.target.deck_name, entries=self.target.entries)
+        return self._pending
+
+    def offer_resume(self):
+        from ui import Dialog
+        data = self._pending
+        if not data:
+            return
+        if self.userdb.deck(data["deck_id"]) is None:  # the deck was deleted meanwhile
+            self.discard_deck_scan()
+            return
+
+        def done(v, _t):
+            if v == "resume":
+                self.resume_deck_scan()
+            elif v == "discard":
+                self.confirm_discard_deck_scan()
+        self.open_dialog(Dialog(f"Resume scanning {data['deck_name']}?",
+                                f"{len(data['entries'])} cards were scanned before the app closed.",
+                                buttons=[("Discard", "discard", "danger"), ("Later", None, "normal"),
+                                         ("Resume", "resume", "primary")], on_done=done))
+
+    def start_deck_scan(self, deck_id):
+        from ui import Dialog
+        deck = self.userdb.deck(deck_id)
+        pending = self.pending_deck_scan()
+        if pending and pending["deck_id"] != deck_id:
+            def done(v, _t):
+                if v == "resume":
+                    self.resume_deck_scan()
+                elif v == "discard":
+                    self.discard_deck_scan()
+                    self.start_deck_scan(deck_id)
+            self.open_dialog(Dialog("Another deck scan isn't finished",
+                                    f"{pending['deck_name']} has {len(pending['entries'])} scanned cards waiting.",
+                                    buttons=[("Cancel", None, "normal"), ("Discard it", "discard", "danger"),
+                                             (f"Resume {pending['deck_name']}", "resume", "primary")], on_done=done))
+            return
+        data = pending if pending and pending["deck_id"] == deck_id else None
+        self.target = DeckScanTarget(DECK_SCAN_PATH, deck_id, deck["name"], self.deck_store, data=data)
+        self.target.save()
+        self._pending = None
+        self.armed, self.last_scanned_small = True, None
+        self.switch_tab("scanner")
+        self.set_status(f"Scanning into {deck['name']} - feed the cards through the box", YELLOW)
+
+    def resume_deck_scan(self):
+        data = self.pending_deck_scan()
+        if data:
+            self.start_deck_scan(data["deck_id"])
+
+    def pause_deck_scan(self):
+        if self.target.kind == "deck":
+            self.target.save()
+            self._pending = dict(deck_id=self.target.deck_id, deck_name=self.target.deck_name,
+                                 entries=self.target.entries)
+            name = self.target.deck_name
+        else:
+            name = None
+        self.target = self.normal_target
+        if name:
+            self.set_status(f"Paused scanning {name} - resume it from the Decks tab", YELLOW)
+
+    def discard_deck_scan(self):
+        if self.target.kind == "deck":
+            self.target.discard()
+            self.target = self.normal_target
+        else:
+            try:
+                os.remove(DECK_SCAN_PATH)
+            except OSError:
+                pass
+        self._pending = None
+        if self.decks_screen is not None:
+            self.decks_screen.bump()
+
+    def confirm_discard_deck_scan(self):
+        from ui import Dialog
+        data = self.pending_deck_scan()
+        if not data:
+            return
+        self.open_dialog(Dialog(f"Discard the scan of {data['deck_name']}?",
+                                f"The {len(data['entries'])} cards scanned so far are thrown away (the deck itself "
+                                "and your Collection are not changed).",
+                                buttons=[("Keep", None, "normal"), ("Discard", True, "danger")],
+                                on_done=lambda v, _t: v and self.discard_deck_scan()))
+
+    def finish_deck_scan(self):
+        """Put the scanned cards into the deck, link free collection copies, and ask about
+        cards that aren't in the Collection yet."""
+        from ui import Dialog
+        t = self.target
+        if t.kind != "deck":
+            return
+        try:
+            rep = self.deck_store.finish_scan(t.deck_id, t.entries)
+        except Exception as e:  # noqa: BLE001
+            self.set_status(f"Couldn't save the deck scan (it's kept, try again): {e}", RED)
+            return
+        t.discard()
+        self.target, self._pending = self.normal_target, None
+        self.switch_tab("decks")
+        self.decks_screen.open_deck(t.deck_id)
+        msg = f"{rep['added']} cards scanned into {t.deck_name}"
+        self.toast(msg)
+        not_in = rep["not_in_collection"]
+        if not not_in:
+            return
+        rows = [self.userdb.deck_card(i) for i in not_in]
+        n = sum(r["quantity"] for r in rows if r)
+        dest = self.destination_name()
+        notes = [f"{rep['linked']} cards matched cards already in your Collection and were linked to this deck."]
+        if rep["in_use"]:
+            notes.append(f"{len(rep['in_use'])} are in your Collection but used by another deck - they're left "
+                         "unlinked (open the card to decide).")
+
+        def done(add, _t):
+            if add:
+                added = self.deck_store.add_to_collection(not_in, self.destination_id())
+                self.toast(f"Added {added} cards to {dest} and assigned them to {t.deck_name}")
+            if self.decks_screen is not None:
+                self.decks_screen.refresh()
+            if self.collection_screen is not None:
+                self.collection_screen.refresh()
+        self.open_dialog(Dialog(f"{n} scanned card{'s are' if n != 1 else ' is'} not in your Collection", notes,
+                                buttons=[("Keep as deck-only", False, "normal"),
+                                         (f"Add to {dest} & assign", True, "primary")], on_done=done))
+
+    def start_commander_scan(self, deck_id, partner=False):
+        deck = self.userdb.deck(deck_id)
+        if self.target.kind == "deck":
+            self.pause_deck_scan()
+        self.target = CommanderPickTarget(deck_id, deck["name"], partner)
+        self.armed, self.last_scanned_small = True, None
+        self.switch_tab("scanner")
+        self.set_status(f"Put the {'partner' if partner else 'commander'} for {deck['name']} in the box", YELLOW)
+
+    def ask_commander(self, result):
+        from ui import Dialog
+        t, card, entry = self.target, result["commander"], result["entry"]
+        role = "partner" if t.partner else "commander"
+
+        def done(yes, _t):
+            if yes:
+                self.deck_store.add_card(t.deck_id, card, entry["finish"], role=role, physical=True, source="scan")
+                self.target = self.normal_target
+                self.switch_tab("decks")
+                self.decks_screen.open_deck(t.deck_id)
+                self.toast(f"{card['name']} is now the {role} of {t.deck_name}")
+            else:
+                self.set_status(f"Not set - put the {role} in the box", YELLOW)
+        self.open_dialog(Dialog(f"Set {card['name']} as {role}?", f"For {t.deck_name}",
+                                buttons=[("No", False, "normal"), ("Yes", True, "primary")], on_done=done))
+
+    def ask_duplicate(self, dup, entry):
+        """A second copy of a card Commander allows once: never dropped silently."""
+        from ui import Dialog
+
+        def done(v, _t):
+            if v in ("remove", "undo") and entry in self.target.entries:
+                self.target.entries.remove(entry)
+                self.target.save()
+                if v == "undo":  # maybe it was misread: look at the card in the box again
+                    self.armed, self.last_scanned_small = True, None
+                self.set_status(f"Removed the extra {dup['name']}", GREY)
+            else:
+                self.set_status(f"Kept {dup['count']} copies of {dup['name']}", YELLOW)
+        beep(False)
+        self.open_dialog(Dialog("Duplicate detected",
+                                [f"{dup['name']} is already in this deck - this would be copy {dup['count']}.",
+                                 f"Commander allows {dup['limit']}."],
+                                buttons=[("Undo last scan", "undo", "normal"), ("Remove duplicate", "remove", "danger"),
+                                         ("Keep anyway", "keep", "primary")], on_done=done))
+
+    def deck_mode_view(self):
+        t = self.target
+        if t.kind == "commander":
+            return dict(kind="commander", name=t.deck_name, partner=t.partner)
+        if t.kind != "deck":
+            return None
+        key = (len(t.entries), t.entries[-1]["id"] if t.entries else None, t.entries[-1]["finish"] if t.entries else None)
+        if self._deck_stats[0] != key:
+            self._deck_stats = (key, t.stats(self.db.by_id))
+        st = self._deck_stats[1]
+        return dict(kind="deck", name=t.deck_name, count=st["count"], size=100, value=st["value"],
+                    unique=st["unique"], commander=st["commander"])
+
+    @staticmethod
+    def clipboard_text():
+        try:
+            import tkinter
+            root = tkinter.Tk()
+            root.withdraw()
+            text = root.clipboard_get()
+            root.destroy()
+            return text
+        except Exception:  # noqa: BLE001
+            return ""
+
     # ---- tabs ------------------------------------------------------------------
 
     def switch_tab(self, tab):
@@ -300,6 +532,12 @@ class Scanner:
                 self.collection_screen = CollectionScreen(self, VIEW_W + PANEL_W, VIEW_H + FOOTER_H)
             else:
                 self.collection_screen.refresh()
+        if tab == "decks" and self.deck_store is not None:
+            if self.decks_screen is None:
+                from decks_view import DecksScreen
+                self.decks_screen = DecksScreen(self, VIEW_W + PANEL_W, VIEW_H + FOOTER_H, store=self.deck_store)
+            else:
+                self.decks_screen.refresh()
         self.tab = tab
 
     def draw_nav(self, width):
@@ -343,6 +581,8 @@ class Scanner:
             body, self._screen_hits = self.collection_screen.render()
         elif self.tab == "collection":
             body = self.draw_placeholder(width, VIEW_H + FOOTER_H, "Collection unavailable (see the console)")
+        elif self.tab == "decks" and self.decks_screen is not None:
+            body, self._screen_hits = self.decks_screen.render()
         elif self.tab in ("decks", "analyse"):
             body = self.draw_placeholder(width, VIEW_H + FOOTER_H, dict(TABS)[self.tab])
         else:
@@ -487,7 +727,7 @@ class Scanner:
                                and self.frac_diff(s, self.last_scanned_small) > CHANGE_FRAC):
                 self.armed = True
             return
-        if present and self.still >= STILL_FRAMES and not self.busy and self.review is None:
+        if present and self.still >= STILL_FRAMES and not self.busy and self.review is None and self.dialog is None:
             self.start_scan(frame)
 
     def start_scan(self, frame, manual=False):
@@ -564,15 +804,19 @@ class Scanner:
         finish = self.settings.get("default_finish", "nonfoil")
         if finish not in (top["finishes"] or "nonfoil").split(","):
             finish = (top["finishes"] or "nonfoil").split(",")[0]
-        self.entries.append(dict(
-            id=top["id"], finish=finish, alts=[p["id"] for p in printings[:40]], alt_idx=0, how=how,
-            time=datetime.now().isoformat(timespec="seconds"),
-        ))
-        self.save_session()
+        entry = dict(id=top["id"], finish=finish, alts=[p["id"] for p in printings[:40]], alt_idx=0, how=how,
+                     time=datetime.now().isoformat(timespec="seconds"))
+        card = self.db.by_id(top["id"]) or dict(top)
+        result = self.target.add(self, entry, card)  # session / deck scan / commander pick
+        if self.target.kind == "commander":
+            self.ask_commander(result)
+            return
         self.set_status(f"+ {ascii_text(top['name'])}", GREEN)
+        if result:
+            self.ask_duplicate(result, entry)
 
     def save_session(self):
-        save_json(SESSION_PATH, self.entries)
+        self.target.save()
 
     def cycle_printing(self, step):
         if not self.entries:
@@ -719,14 +963,16 @@ class Scanner:
         view = dict(count=len(self.entries), total=total, rate=rate, lock=self.settings.get("locked_set"),
                     foil_default=self.settings.get("default_finish") == "foil", camera=self.cam_index,
                     last=last, recent=recent, review=review, typing=self.typing, bg=bg, bg_menu=self.bg_menu,
-                    money=self.money, show_destination=self.userdb is not None,
+                    money=self.money, deck_mode=self.deck_mode_view(),
+                    show_destination=self.userdb is not None and self.target is self.normal_target,
                     destination=self.destination_name() if self.userdb is not None else None,
                     can_choose_destination=self.userdb is not None and len(self.userdb.collections()) > 1,
                     pending=len(self.pending_entries()))
         key = (len(self.entries), round(total, 2), round(rate), view["lock"], view["foil_default"], self.cam_index,
                (self.entries[-1]["id"], self.entries[-1]["finish"], self.entries[-1]["alt_idx"]) if self.entries else None,
                id(self.review), repr(self.typing), self.bg_state, self.bg_menu, meta.get("saved_at"),
-               display_currency(self.settings), view["destination"], view["can_choose_destination"], view["pending"])
+               display_currency(self.settings), view["destination"], view["can_choose_destination"], view["pending"],
+               repr(view["deck_mode"]))
         return view, key
 
     def on_panel_click(self, x, y):
@@ -736,6 +982,16 @@ class Scanner:
                             search="s", skip="x")
                 if action == "add_collection":
                     self.add_to_collection()
+                elif action == "finish_deck":
+                    self.finish_deck_scan()
+                elif action == "pause_deck":
+                    self.pause_deck_scan()
+                    self.switch_tab("decks")
+                elif action == "cancel_commander":
+                    deck_id = self.target.deck_id
+                    self.target = self.normal_target
+                    self.switch_tab("decks")
+                    self.decks_screen.open_deck(deck_id)
                 elif action == "destination":
                     self.choose_destination()
                 elif action == "bg_menu":
@@ -786,6 +1042,12 @@ class Scanner:
             elif event == cv2.EVENT_MOUSEWHEEL:
                 self.collection_screen.wheel(cv2.getMouseWheelDelta(flags))
             return
+        if self.tab == "decks" and self.decks_screen is not None:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.decks_screen.click(x, y, self._screen_hits)
+            elif event == cv2.EVENT_MOUSEWHEEL:
+                self.decks_screen.wheel(cv2.getMouseWheelDelta(flags))
+            return
         if self.tab != "scanner":
             return
         self.on_scanner_mouse(event, x, y, flags)
@@ -830,6 +1092,10 @@ class Scanner:
         if self.tab == "collection":
             if self.collection_screen is not None:
                 self.collection_screen.key(key)
+            return True
+        if self.tab == "decks":
+            if self.decks_screen is not None:
+                self.decks_screen.key(key)
             return True
         if self.tab != "scanner":
             return True
@@ -896,6 +1162,8 @@ class Scanner:
             self.settings["default_finish"] = "nonfoil" if foil else "foil"
             save_json(SETTINGS_PATH, self.settings)
             self.set_status(f"New cards default to {'non-foil' if foil else 'FOIL'}", WHITE)
+        elif ch == "n" and self.target is not self.normal_target:
+            self.set_status("Finish or pause the deck scan first", YELLOW)
         elif ch == "n":
             if time.time() - self.new_list_pressed < 3:
                 if self.entries:

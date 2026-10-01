@@ -159,6 +159,36 @@ MIGRATIONS = [
             details TEXT,
             created_at TEXT NOT NULL DEFAULT ({NOW}))""",
     ]),
+    (3, "Commander decks: physical deck cards, ownership view, deck card counts", [
+        # 1 = this card is physically in the deck (it was scanned); 0 = planned / imported
+        """ALTER TABLE deck_cards ADD COLUMN physical INTEGER NOT NULL DEFAULT 0""",
+        """ALTER TABLE deck_cards ADD COLUMN source TEXT""",  # 'scan', 'manual', 'import', 'duplicate'
+        """CREATE INDEX deck_cards_scryfall ON deck_cards(scryfall_id)""",
+        # How each deck card is owned - the question Phase 4 asks most.
+        """CREATE VIEW deck_card_ownership AS
+            SELECT dc.id AS deck_card_id, dc.deck_id, dc.card_name, dc.oracle_id, dc.scryfall_id, dc.finish,
+                   dc.quantity, dc.role, dc.physical, dc.collection_item_id,
+                   ci.scryfall_id AS owned_scryfall_id, ci.finish AS owned_finish, ci.collection_id,
+                   CASE WHEN dc.collection_item_id IS NOT NULL THEN
+                            CASE WHEN ci.scryfall_id = dc.scryfall_id AND (dc.finish IS NULL OR ci.finish = dc.finish)
+                                     THEN 'exact'
+                                 WHEN ci.scryfall_id = dc.scryfall_id THEN 'different_finish'
+                                 ELSE 'different_printing' END
+                        WHEN dc.physical = 1 THEN 'deck_only'
+                        ELSE 'missing' END AS ownership
+            FROM deck_cards dc LEFT JOIN collection_items ci ON ci.id = dc.collection_item_id""",
+        # Commander decks count commander + partner + main deck (not companion / sideboard / maybe).
+        """DROP VIEW deck_summary""",
+        """CREATE VIEW deck_summary AS
+            SELECT d.id AS deck_id, d.name, d.format, d.notes, d.created_at, d.updated_at,
+                   (SELECT card_name FROM deck_cards WHERE deck_id = d.id AND role = 'commander') AS commander,
+                   (SELECT scryfall_id FROM deck_cards WHERE deck_id = d.id AND role = 'commander') AS commander_scryfall_id,
+                   (SELECT card_name FROM deck_cards WHERE deck_id = d.id AND role = 'partner') AS partner,
+                   (SELECT scryfall_id FROM deck_cards WHERE deck_id = d.id AND role = 'partner') AS partner_scryfall_id,
+                   (SELECT COALESCE(SUM(quantity), 0) FROM deck_cards WHERE deck_id = d.id
+                        AND role IN ('commander', 'partner', 'main')) AS card_count
+            FROM decks d""",
+    ]),
 ]
 LATEST_VERSION = MIGRATIONS[-1][0]
 
@@ -526,6 +556,107 @@ class UserDB:
         with self.transaction() as c:
             return c.execute("INSERT INTO decks (name, format, notes) VALUES (?, ?, ?)", (name, format, notes)).lastrowid
 
+    def rename_deck(self, deck_id, name):
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("a deck needs a name")
+        with self.transaction() as c:
+            c.execute("UPDATE decks SET name = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+                      (name, deck_id))
+
+    def delete_deck(self, deck_id):
+        """Delete a deck and its card list. Collection cards are untouched: their deck
+        allocations simply disappear with the deck cards (copies become free again)."""
+        with self.transaction() as c:
+            c.execute("DELETE FROM decks WHERE id = ?", (deck_id,))
+
+    def duplicate_deck(self, deck_id, name):
+        """Copy a deck's card list into a new deck. The copy does NOT claim the original's
+        physical cards: links to collection copies and 'physically in the deck' are not
+        copied (re-link with decks.DeckStore.allocate). Returns the new deck id."""
+        with self.transaction() as c:
+            src = c.execute("SELECT * FROM decks WHERE id = ?", (deck_id,)).fetchone()
+            if src is None:
+                raise ValueError("no such deck")
+            new = c.execute("INSERT INTO decks (name, format, notes) VALUES (?, ?, ?)",
+                            (name, src["format"], src["notes"])).lastrowid
+            c.execute("""INSERT INTO deck_cards (deck_id, card_name, oracle_id, scryfall_id, quantity, finish, role,
+                                                 collection_item_id, physical, source)
+                         SELECT ?, card_name, oracle_id, scryfall_id, quantity, finish, role, NULL, 0, 'duplicate'
+                         FROM deck_cards WHERE deck_id = ? ORDER BY id""", (new, deck_id))
+            return new
+
+    def deck_card(self, deck_card_id):
+        r = self.conn.execute("SELECT * FROM deck_cards WHERE id = ?", (deck_card_id,)).fetchone()
+        return dict(r) if r else None
+
+    def remove_deck_card(self, deck_card_id):
+        """Take a card out of a deck (its collection copy becomes free again)."""
+        with self.transaction() as c:
+            c.execute("DELETE FROM deck_cards WHERE id = ?", (deck_card_id,))
+
+    def update_deck_card(self, deck_card_id, quantity=None, finish=_UNSET, scryfall_id=None, card_name=None,
+                         oracle_id=_UNSET, physical=None, unlink=False):
+        """Edit a deck card. Changing quantity is checked against its linked collection
+        copy (can't use more copies than are free); a new printing/finish/name or
+        unlink=True drops the link to the collection copy."""
+        with self.transaction() as c:
+            dc = c.execute("SELECT * FROM deck_cards WHERE id = ?", (deck_card_id,)).fetchone()
+            if dc is None:
+                raise ValueError("no such deck card")
+            sets, args = [], []
+            drop_link = unlink
+            if scryfall_id is not None and scryfall_id != dc["scryfall_id"]:
+                sets.append("scryfall_id = ?")
+                args.append(scryfall_id)
+                drop_link = True
+            if card_name is not None and card_name != dc["card_name"]:
+                sets.append("card_name = ?")
+                args.append(card_name)
+                drop_link = True
+            if finish is not self._UNSET and finish != dc["finish"]:
+                if finish is not None and finish not in FINISHES:
+                    raise ValueError(f"finish must be one of {FINISHES}")
+                sets.append("finish = ?")
+                args.append(finish)
+                drop_link = True
+            if oracle_id is not self._UNSET:
+                sets.append("oracle_id = ?")
+                args.append(oracle_id)
+            if physical is not None:
+                sets.append("physical = ?")
+                args.append(1 if physical else 0)
+            if quantity is not None:
+                if quantity < 1:
+                    raise ValueError("quantity must be at least 1 (remove the card instead)")
+                if dc["collection_item_id"] is not None and not drop_link:
+                    self._check_available(c, dc["collection_item_id"], quantity, ignore_deck_card=deck_card_id)
+                sets.append("quantity = ?")
+                args.append(quantity)
+            if drop_link and dc["collection_item_id"] is not None:
+                sets.append("collection_item_id = NULL")
+            if sets:
+                c.execute(f"UPDATE deck_cards SET {', '.join(sets)} WHERE id = ?", (*args, deck_card_id))
+
+    def set_role(self, deck_card_id, role):
+        """Make a deck card the commander / partner / a main-deck card. The previous
+        commander (or partner) becomes a main-deck card."""
+        if role not in DECK_ROLES:
+            raise ValueError(f"role must be one of {DECK_ROLES}")
+        with self.transaction() as c:
+            dc = c.execute("SELECT deck_id, quantity FROM deck_cards WHERE id = ?", (deck_card_id,)).fetchone()
+            if dc is None:
+                raise ValueError("no such deck card")
+            if role in ("commander", "partner"):
+                c.execute("UPDATE deck_cards SET role = 'main' WHERE deck_id = ? AND role = ?", (dc["deck_id"], role))
+                if dc["quantity"] > 1:  # only one copy can be the commander; the rest stay in the deck
+                    c.execute("""INSERT INTO deck_cards (deck_id, card_name, oracle_id, scryfall_id, quantity, finish,
+                                                         role, physical, source)
+                                 SELECT deck_id, card_name, oracle_id, scryfall_id, quantity - 1, finish, 'main',
+                                        physical, source FROM deck_cards WHERE id = ?""", (deck_card_id,))
+                    c.execute("UPDATE deck_cards SET quantity = 1 WHERE id = ?", (deck_card_id,))
+            c.execute("UPDATE deck_cards SET role = ? WHERE id = ?", (role, deck_card_id))
+
     def deck(self, deck_id):
         r = self.conn.execute("SELECT * FROM deck_summary WHERE deck_id = ?", (deck_id,)).fetchone()
         return dict(r) if r else None
@@ -534,28 +665,37 @@ class UserDB:
         return [dict(r) for r in self.conn.execute("SELECT * FROM deck_summary ORDER BY updated_at DESC")]
 
     def add_deck_card(self, deck_id, card_name, quantity=1, role="main", scryfall_id=None, finish=None,
-                      collection_item_id=None, oracle_id=None):
+                      collection_item_id=None, oracle_id=None, physical=False, source=None, _conn=None):
         """Add a card to a deck. collection_item_id = the collection lot the physical card
         comes from (checked: it must have enough free copies). Returns the deck-card id."""
         if role not in DECK_ROLES:
             raise ValueError(f"role must be one of {DECK_ROLES}")
-        with self.transaction() as c:
+
+        def run(c):
             if collection_item_id is not None:
                 self._check_available(c, collection_item_id, quantity)
             return c.execute(
                 """INSERT INTO deck_cards (deck_id, card_name, oracle_id, scryfall_id, quantity, finish, role,
-                                           collection_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (deck_id, card_name, oracle_id, scryfall_id, quantity, finish, role, collection_item_id)).lastrowid
+                                           collection_item_id, physical, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (deck_id, card_name, oracle_id, scryfall_id, quantity, finish, role, collection_item_id,
+                 1 if physical else 0, source)).lastrowid
+        if _conn is not None:
+            return run(_conn)
+        with self.transaction() as c:
+            return run(c)
 
-    def set_commander(self, deck_id, card_name, scryfall_id=None, partner=False, collection_item_id=None):
+    def set_commander(self, deck_id, card_name, scryfall_id=None, partner=False, collection_item_id=None,
+                      finish=None, oracle_id=None, physical=False, source="manual"):
+        """Set the commander (or partner). The previous one is removed from the deck."""
         role = "partner" if partner else "commander"
         with self.transaction() as c:
             c.execute("DELETE FROM deck_cards WHERE deck_id = ? AND role = ?", (deck_id, role))
             if collection_item_id is not None:
                 self._check_available(c, collection_item_id, 1)
-            return c.execute("INSERT INTO deck_cards (deck_id, card_name, scryfall_id, quantity, role, "
-                             "collection_item_id) VALUES (?, ?, ?, 1, ?, ?)",
-                             (deck_id, card_name, scryfall_id, role, collection_item_id)).lastrowid
+            return c.execute("INSERT INTO deck_cards (deck_id, card_name, oracle_id, scryfall_id, quantity, finish, "
+                             "role, collection_item_id, physical, source) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+                             (deck_id, card_name, oracle_id, scryfall_id, finish, role, collection_item_id,
+                              1 if physical else 0, source)).lastrowid
 
     def allocate(self, deck_card_id, collection_item_id):
         """Say which owned physical copy a deck card uses."""
