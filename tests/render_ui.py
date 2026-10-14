@@ -41,10 +41,31 @@ def main(out):
         s.learn_background()
         shot = lambda name: cv2.imwrite(os.path.join(out, name), s.draw_window(frame))
         shot("1_scanner.png")
+        s.set_auto_scan(True)
+        shot("1b_scanner_on.png")
+        s.set_auto_scan(False)
+        tv = cv2.imread(os.path.join(HERE, "fixtures", "real_thought_vessel_1.jpg"))
+        prints, choice = s.rec.printings_for("Thought Vessel", tv)
+        s.add_card(prints, tv, "picture", choice, 0.99)
+        shot("1c_printing_certain.png")
+        prints, choice = s.rec.printings_for("Sol Ring", None)
+        s.add_card(prints, None, "picture", choice, 0.97)
+        shot("1d_printing_uncertain.png")
+        s.choose_printing()
+        shot("1e_choose_printing.png")
+        s.dialog = None
+        s.entries = []
+        s.save_session()
         s.add_to_collection()
         shot("2_added_dialog.png")
-        s.dialog.finish(False)  # keep list
+        if s.dialog is not None:
+            s.dialog.finish(False)  # keep list
         s.dialog = None
+        if not s.userdb.items():  # empty scan list: use a few sample cards instead
+            for n, f in (("Sol Ring", "foil"), ("Rhystic Study", "nonfoil"), ("Lightning Bolt", "nonfoil")):
+                card = s.deck_store.default_printing(n)
+                s.userdb.add_card(card["id"], card["name"], card["set_code"], card["collector_number"], finish=f,
+                                  oracle_id=card["oracle_id"], market_price=float(card["usd_foil" if f == "foil" else "usd"] or 0))
         s.switch_tab("collection")
         c = s.collection_screen
         shot("3_collection.png")
@@ -53,6 +74,12 @@ def main(out):
         shot("4_detail.png")
         s.set_currency("ZAR")
         shot("5_detail_zar.png")
+        c.action("printing")
+        shot("5b_printing_picker.png")
+        for ch in "cmm":
+            s.dialog.key(ord(ch))
+        shot("5c_printing_picker_filtered.png")
+        s.dialog = None
         c.search = "go"
         c.focus = "search"
         c.refresh()
@@ -110,10 +137,8 @@ def main(out):
             s.target.add(s, dict(id=c["id"], finish="nonfoil", alts=[c["id"]], alt_idx=0, how="picture"), c)
         shot("15_scanner_deck_mode.png")
         c = st.default_printing("Sol Ring")
-        entry = dict(id=c["id"], finish="nonfoil", alts=[c["id"]], alt_idx=0, how="picture")
-        s.ask_duplicate(s.target.add(s, entry, c), entry)
-        shot("16_duplicate_dialog.png")
-        s.dialog = None
+        s.add_card([dict(c)], None)  # a second Sol Ring: ignored, status line only
+        shot("16_duplicate_ignored.png")
         s.pause_deck_scan()
         # ---- analyse
         for n in ("Beast Whisperer", "Guardian Project", "Path to Exile", "Toxic Deluge", "Inexorable Tide",

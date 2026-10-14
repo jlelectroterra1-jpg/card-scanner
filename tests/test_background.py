@@ -123,6 +123,8 @@ class BackgroundTests(unittest.TestCase):
             started.append(manual)
             real_start(frame, manual)
         s.start_scan = spy
+        if not s.auto_scan:
+            s.set_auto_scan(True)  # Start Scan (scanning starts OFF)
         for f in frames:
             s.last_frame = f
             if s.background is not None:

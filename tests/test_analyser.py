@@ -273,8 +273,10 @@ class AnalysisTests(TempDB, unittest.TestCase):
         for res in (self.coll, self.all):
             for s in res["swaps"]:
                 self.assertTrue(s["why_in"], s)
-                self.assertIn(s["confidence"], ("Strong suggestion", "Worth considering", "Situational",
-                                                "Depends on your intended strategy"))
+                self.assertIn(s["confidence"], ("HIGH CONFIDENCE", "GOOD UPGRADE", "OPTIONAL / PREFERENCE"))
+                self.assertTrue(s["why_out"], s)  # each OUT card has its own reasons
+                self.assertTrue(s["gains"] and s["net"], s)  # ... and the swap says what improves
+                self.assertGreater(s["net_value"], 0)
                 text = " ".join(s["why_in"] + s["why_out"]).lower()
                 for word in BANNED_WORDS:
                     self.assertNotIn(word, text)
@@ -504,8 +506,8 @@ class ScenarioTest(TempDB, unittest.TestCase):
         self.wait(sc)
         self.assertTrue(sc.result["swaps"])
         self.assertFalse(sc.stale)
-        self.assertEqual(sc.selected, set(range(len(sc.result["swaps"]))))
-        for tab in ("overview", "swaps", "combos"):
+        self.assertEqual(sc.selected, set())  # nothing is ticked until you choose
+        for tab in ("overview", "swaps", "consider", "review", "combos"):
             sc.tab = tab
             sc.bump()
             img, hits = sc.render()

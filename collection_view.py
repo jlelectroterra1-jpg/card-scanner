@@ -29,7 +29,9 @@ FAILED = object()  # what _guard returns when a change was refused
 
 LIST_X0, LIST_X1 = 16, 930
 PANE_X0 = 946
-TOOLBAR_Y, LIST_Y0, ROW_H = 60, 108, 40
+TOOLBAR_Y, LIST_Y0, ROW_H = 60, 108, 46
+THUMB_W, THUMB_H = 30, 42  # list thumbnails (Magic card ratio 63:88)
+CY = (ROW_H - 2) // 2       # vertical centre of a row
 
 
 class CollectionScreen:
@@ -104,7 +106,7 @@ class CollectionScreen:
         if img is None:
             self._fetch(row.get("image_small"), path)
             return None
-        img = cv2.resize(img, (26, 36), interpolation=cv2.INTER_AREA)
+        img = cv2.resize(img, (THUMB_W, THUMB_H), interpolation=cv2.INTER_AREA)
         self.thumbs[sid] = img
         if len(self.thumbs) > 600:
             self.thumbs.popitem(last=False)
@@ -254,7 +256,7 @@ class CollectionScreen:
     def _list(self, p):
         x0, x1 = LIST_X0, LIST_X1
         y = LIST_Y0
-        cols = [("Card", 36, "name"), ("Set", 330, "set"), ("Rarity", 430, None), ("Finish", 532, None),
+        cols = [("Card", 42, "name"), ("Set", 330, "set"), ("Rarity", 430, None), ("Finish", 532, None),
                 ("Cond.", 606, None), ("Qty", 690, "quantity"), ("Each", 760, "price"), ("Total", 850, "value")]
         for label, cx, sort in cols:
             colour = YELLOW if sort == self.sort else MUTED
@@ -271,21 +273,21 @@ class CollectionScreen:
             ry = y + i * ROW_H
             bg = ROW_SEL if r["id"] == self.selected else (ROW_ALT if (self.scroll + i) % 2 else BG)
             p.d.rectangle((x0, ry, x1 - 12, ry + ROW_H - 2), fill=bg)
-            p.paste(self.thumb(r), x0 + 4, ry + 2, 26, 36, radius=3)
-            p.text((x0 + 36, ry + 19), r["card_name"], font="rowb", anchor="lm", width=286)
-            p.text((x0 + 330, ry + 19), f"{r['set_code'].upper()} #{num(r['collector_number'])}", font="row", fill=MUTED,
+            p.paste(self.thumb(r), x0 + 4, ry + (ROW_H - 2 - THUMB_H) // 2, THUMB_W, THUMB_H, radius=3)
+            p.text((x0 + 42, ry + CY), r["card_name"], font="rowb", anchor="lm", width=280)
+            p.text((x0 + 330, ry + CY), f"{r['set_code'].upper()} #{num(r['collector_number'])}", font="row", fill=MUTED,
                    anchor="lm", width=94)
             if r.get("rarity"):
-                p.rarity_dot(x0 + 430, ry + 15, r["rarity"])
-                p.text((x0 + 444, ry + 19), r["rarity"].title(), font="small", fill=MUTED, anchor="lm", width=84)
-            p.text((x0 + 532, ry + 19), finish_label(r["finish"]), font="row",
+                p.rarity_dot(x0 + 430, ry + CY - 4, r["rarity"])
+                p.text((x0 + 444, ry + CY), r["rarity"].title(), font="small", fill=MUTED, anchor="lm", width=84)
+            p.text((x0 + 532, ry + CY), finish_label(r["finish"]), font="row",
                    fill=YELLOW if r["finish"] != "nonfoil" else MUTED, anchor="lm")
-            p.text((x0 + 606, ry + 19), COND_SHORT.get(r["condition"], r["condition"]), font="row", fill=MUTED, anchor="lm")
-            p.text((x0 + 720, ry + 19), str(r["quantity"]), font="rowb", anchor="rm")
+            p.text((x0 + 606, ry + CY), COND_SHORT.get(r["condition"], r["condition"]), font="row", fill=MUTED, anchor="lm")
+            p.text((x0 + 720, ry + CY), str(r["quantity"]), font="rowb", anchor="rm")
             price = r["market_price"]
-            p.text((x0 + 830, ry + 19), self.money(price) if price is not None else "-", font="row",
+            p.text((x0 + 830, ry + CY), self.money(price) if price is not None else "-", font="row",
                    fill=GOLD if (price or 0) >= HIGH_VALUE else MUTED, anchor="rm")
-            p.text((x1 - 16, ry + 19), self.money(r["value"]), font="rowb",
+            p.text((x1 - 16, ry + CY), self.money(r["value"]), font="rowb",
                    fill=GOLD if r["value"] >= HIGH_VALUE else TEXT, anchor="rm")
             p.hit((x0, ry, x1 - 12, ry + ROW_H - 2), ("row", r["id"]))
         # scrollbar
@@ -314,6 +316,7 @@ class CollectionScreen:
         p.button((x1 - 34, y0 + 8, x1 - 8, y0 + 34), "x", "close")
         iw, ih = 150, 209
         p.paste(self.large(r), x0 + 14, y0 + 14, iw, ih, radius=8)
+        p.hit((x0 + 14, y0 + 14, x0 + 14 + iw, y0 + 14 + ih), ("view", r["scryfall_id"]))  # click = large viewer
         tx, tw = x0 + 14 + iw + 14, x1 - (x0 + 14 + iw + 14) - 40
         y = y0 + 16
         for line in _wrap2(p, r["card_name"], "name", tw + 30):
@@ -323,24 +326,27 @@ class CollectionScreen:
         y += 22
         if r.get("rarity"):
             p.rarity_dot(tx, y + 4, r["rarity"])
-        p.text((tx + 14, y), f"{r['set_code'].upper()} #{num(r['collector_number'])} · {(r.get('rarity') or '').title()}",
-               font="small", fill=MUTED)
+        lang = "" if (r.get("language") or "en") == "en" else f" · {r['language'].upper()}"
+        p.text((tx + 14, y), f"{r['set_code'].upper()} #{num(r['collector_number'])} · {(r.get('rarity') or '').title()}"
+                             f"{lang}", font="small", fill=MUTED)
         y += 22
+        p.button((tx, y, tx + 150, y + 26), "Change printing", "printing", font="label")
+        y += 32
         p.text((tx, y), f"In: {r['collection_name']}", font="small", fill=MUTED, width=tw + 30)
-        y += 30
+        y += 24
         price = r["market_price"]
-        p.text((tx, y), self.money(price) if price is not None else "no price", font="big",
-               fill=GOLD if (price or 0) >= HIGH_VALUE else TEXT)
-        y += 36
-        p.text((tx, y), "each", font="small", fill=MUTED)
-        y += 24
+        ptxt = self.money(price) if price is not None else "no price"
+        p.text((tx, y), ptxt, font="big", fill=GOLD if (price or 0) >= HIGH_VALUE else TEXT)
+        p.text((tx + p.f["big"].getlength(ptxt) + 8, y + 14), "each", font="small", fill=MUTED)
+        y += 34
         p.text((tx, y), f"Total {self.money(r['value'])}", font="rowb")
-        y += 24
+        y += 22
         if r.get("price_updated_at"):
             p.text((tx, y), f"price from {r['price_updated_at'][:10]}", font="small", fill=MUTED)
+        y += 18
 
         # editable fields under the picture
-        y = y0 + 14 + ih + 12
+        y = max(y0 + 14 + ih + 12, y + 4)
         lx, vx = x0 + 16, x0 + 130
         alloc = self.app.userdb.availability(r["id"]) or {}
         p.text((lx, y + 15), "Quantity", font="small", fill=MUTED, anchor="lm")
@@ -451,6 +457,9 @@ class CollectionScreen:
         elif action == "clear":
             self.search, self.filters = "", {}
             self.refresh(False)
+        elif isinstance(action, tuple) and action[0] == "view":
+            from card_viewer import open_viewer
+            open_viewer(self.app, self.store.card(action[1]))
         elif isinstance(action, tuple) and action[0] == "row":
             self.selected = None if self.selected == action[1] else action[1]
         elif isinstance(action, tuple) and action[0] == "sortcol":
@@ -578,11 +587,12 @@ class CollectionScreen:
                 return self.confirm_remove(r)
             self._guard(udb.set_quantity, r["id"], r["quantity"] - 1)
         elif isinstance(action, tuple) and action[0] == "finish" and action[1] != r["finish"]:
-            f = action[1]
-            price = {"foil": r.get("usd_foil"), "etched": r.get("usd_etched")}.get(f) or r.get("usd")
-            new_id = self._guard(udb.update_item, r["id"], finish=f, market_price=float(price) if price else None)
-            if isinstance(new_id, int):
-                self.selected = new_id
+            return self.change(r, finish=action[1])
+        elif action == "printing":
+            if not self.store.has_cards_db:
+                return self.app.toast("Card data missing - run Update Prices first", RED)
+            self.app.open_dialog(PrintingPicker(self, r))
+            return
         elif action == "condition":
             self.app.open_dialog(Dialog(
                 "Condition", f"{r['card_name']} ({r['set_code'].upper()})", kind="choice",
@@ -619,6 +629,47 @@ class CollectionScreen:
         elif action == "remove":
             return self.confirm_remove(r)
         self.refresh()
+
+    def change(self, r, scryfall_id=None, finish=None):
+        """Correct the printing and/or finish of a lot. Merges with an identical lot you
+        already have - asking first when their purchase prices or notes differ."""
+        store = self.store
+        check = self._guard(store.merge_check, r["id"], scryfall_id=scryfall_id,
+                            finish=finish or (None if scryfall_id else r["finish"]))
+        if check is FAILED:
+            return
+
+        def do():
+            if scryfall_id:
+                lot = self._guard(store.change_printing, r["id"], scryfall_id, finish)
+            else:
+                lot = self._guard(store.change_finish, r["id"], finish)
+            if lot is FAILED:
+                return self.refresh()
+            new = self.app.userdb.item(lot)
+            what = f"{new['set_code'].upper()} #{num(new['collector_number'])} {finish_label(new['finish'])}"
+            msg = (f"Merged: now {new['quantity']} x {new['card_name']} ({what})" if check
+                   else f"Changed to {what}")
+            self._after(lot, msg)
+
+        if check and check["conflicts"]:
+            t = check["target"]
+            lines = [f"You already have {t['quantity']} x {t['card_name']} ({t['set_code'].upper()} "
+                     f"#{num(t['collector_number'])}, {finish_label(t['finish'])}, "
+                     f"{CONDITION_LABELS.get(t['condition'], t['condition'])}) in this collection.",
+                     f"The two entries will become one of {t['quantity'] + r['quantity']} copies. "
+                     f"Their {' and '.join(check['conflicts'])} differ:"]
+            if "purchase price" in check["conflicts"]:
+                lines.append("- purchase price becomes the average per copy; both original prices are "
+                             "written into the notes")
+            if "notes" in check["conflicts"]:
+                lines.append("- both notes are kept (joined)")
+            lines.append("Deck links stay with the cards.")
+            self.app.open_dialog(Dialog("Merge with your existing copies?", lines,
+                                        buttons=[("Cancel", None, "normal"), ("Merge", True, "primary")],
+                                        on_done=lambda v, _t: v and do()))
+            return
+        do()
 
     def _after(self, result, message=None):
         if result is not FAILED and message:
@@ -672,22 +723,46 @@ class CollectionScreen:
             options.append(("rename", f"Rename {name}", "normal"))
             if not is_main:
                 options.append(("delete", f"Delete {name}", "danger"))
+        else:
+            options.append(("rename_pick", "Rename a collection...", "normal"))
         note = (f"{name} is your main collection - it can be renamed but not deleted." if is_main
-                else "Pick a collection at the top left to manage it.")
+                else "Rename or delete the collection picked at the top left (or rename any collection)."
+                if cid is None else f"Manage {name}.")
         self.app.open_dialog(Dialog("Collections", note, kind="choice",
                                     options=options, buttons=[("Close", None, "normal")],
                                     on_done=lambda v, _t: {"new": self.new_collection, "rename": self.rename,
+                                                           "rename_pick": self.rename_pick,
                                                            "delete": self.delete}.get(v, lambda: None)()))
 
-    def rename(self):
-        cid, name = self.collection_id, self._collection_name()
+    def rename_pick(self):
+        """Choose which collection to rename (when 'All collections' is showing)."""
+        self.app.open_dialog(Dialog(
+            "Rename which collection?", kind="choice", buttons=[("Cancel", None, "normal")],
+            options=[(c["id"], c["name"] + ("  (main)" if c["is_default"] else ""), "normal")
+                     for c in self._collections()],
+            on_done=lambda v, _t: v is not None and self.rename(v)))
+
+    def rename(self, cid=None, text=None, problem=None):
+        """Rename a collection - only its name changes (same id, cards, deck links, default flag)."""
+        cid = cid if cid is not None else self.collection_id
+        col = next((c for c in self._collections() if c["id"] == cid), None)
+        if col is None:
+            return
+        name = col["name"]
+        msg = [problem] if problem else []
+        msg.append("Only the name changes - its cards, deck links and settings stay exactly as they are.")
 
         def done(v, t):
-            if v and t.strip() and t.strip() != name:
-                if self._guard(self.app.userdb.rename_collection, cid, t.strip()) is not FAILED:
-                    self.app.toast(f"Renamed to {t.strip()}", GREEN)
+            if not v:
+                return
+            try:
+                new = self.app.userdb.rename_collection(cid, t)
+            except (UserDBError, ValueError) as e:
+                return self.rename(cid, t, str(e))  # ask again, keeping what was typed
+            if new != name:
+                self.app.toast(f'Renamed "{name}" to "{new}"', GREEN)
             self.refresh()
-        self.app.open_dialog(Dialog(f"Rename {name}", kind="input", text=name,
+        self.app.open_dialog(Dialog(f"Rename {name}", msg, kind="input", text=name if text is None else text,
                                     buttons=[("Cancel", None, "normal"), ("Rename", True, "primary")], on_done=done))
 
     def delete(self):
@@ -863,6 +938,186 @@ class ImportPreview(Dialog):
             if copies:
                 self.screen.app.toast(f"Imported {copies:,} cards into {self.collection_name}", GREEN)
             self.screen.refresh()
+
+
+class PrintingPicker(Dialog):
+    """Pick the exact printing (and finish) of a collection lot. All printings of the
+    card (by oracle ID) from the local card data; type to filter by set name, set code
+    or collector number. Click a printing to preview it, then Use this printing."""
+
+    VIS = 9
+
+    def __init__(self, screen, row):
+        super().__init__(f"Change printing - {row['card_name']}")
+        self.screen, self.row = screen, row
+        self.all = screen.store.printings_for(row)
+        self.text, self.scroll = "", 0
+        self.shown = list(self.all)
+        self.sel = next((c["id"] for c in self.all if c["id"] == row["scryfall_id"]), self.all[0]["id"] if self.all else None)
+        self.finish = row["finish"]
+        self.scroll_to_sel()
+
+    def card(self):
+        """The selected printing - only while the filter still shows it."""
+        return next((c for c in self.shown if c["id"] == self.sel), None)
+
+    def filter(self):
+        words = self.text.lower().split()
+
+        def ok(c):
+            hay = f"{c.get('set_name') or ''} {c['set_code']} #{c['collector_number']} {c['collector_number']}".lower()
+            return all(w.lstrip("#") in hay for w in words)
+        self.shown = [c for c in self.all if ok(c)]
+        self.scroll = 0
+        if self.shown and self.sel not in {c["id"] for c in self.shown}:
+            self.select(self.shown[0]["id"])
+
+    def select(self, sid):
+        self.sel = sid
+        fins = self.screen.store.finishes_of(self.card()) or ["nonfoil"]
+        if self.finish not in fins:
+            self.finish = self.row["finish"] if self.row["finish"] in fins else fins[0]
+
+    def scroll_to_sel(self):
+        ids = [c["id"] for c in self.shown]
+        if self.sel in ids:
+            i = ids.index(self.sel)
+            if not self.scroll <= i < self.scroll + self.VIS:
+                self.scroll = max(0, i - self.VIS // 2)
+
+    def prices(self, c):
+        store, out = self.screen.store, []
+        for f in store.finishes_of(c):
+            v = store.price_of(c, f)
+            out.append(f"{'' if f == 'nonfoil' else finish_label(f) + ' '}{self.screen.money(v) if v is not None else '-'}")
+        return "  ".join(out) or "-"
+
+    def draw(self, canvas_bgr):
+        import numpy as np
+        from PIL import Image, ImageDraw
+        H, W = canvas_bgr.shape[:2]
+        p = Painter(W, H)
+        p.img = Image.fromarray(cv2.cvtColor((canvas_bgr * 0.35).astype(np.uint8), cv2.COLOR_BGR2RGB))
+        p.d = ImageDraw.Draw(p.img)
+        x0, y0, x1, y1 = 60, 20, W - 60, H - 20
+        p.d.rounded_rectangle((x0, y0, x1, y1), radius=14, fill=CARD_BG, outline=BUTTON_HI)
+        p.text((x0 + 24, y0 + 18), self.title, font="name", fill=YELLOW, width=x1 - x0 - 48)
+        lx1 = x1 - 250  # list on the left, preview on the right
+        y = y0 + 50
+        p.input_box((x0 + 24, y, lx1, y + 34), self.text, "Filter by set name, set code or collector number...",
+                    True, None)
+        y += 42
+        p.text((x0 + 24, y), f"{len(self.shown)} of {len(self.all)} printings", font="small", fill=MUTED)
+        y += 22
+        rh = 44
+        self.scroll = max(0, min(self.scroll, max(0, len(self.shown) - self.VIS)))
+        for c in self.shown[self.scroll:self.scroll + self.VIS]:
+            on = c["id"] == self.sel
+            p.d.rounded_rectangle((x0 + 24, y, lx1, y + rh - 4), radius=8, fill=BUTTON_HI if on else BUTTON,
+                                  outline=YELLOW if on else None)
+            p.paste(self.screen.thumb(dict(scryfall_id=c["id"], image_small=c.get("image_small"))),
+                    x0 + 30, y + 2, 26, 36, radius=2)
+            p.rarity_dot(x0 + 64, y + 9, c.get("rarity"))
+            p.text((x0 + 78, y + 3), c.get("set_name") or c["set_code"].upper(), font="rowb", width=300)
+            lang = "" if (c.get("lang") or "en") == "en" else f" · {c['lang'].upper()}"
+            sub = (f"{c['set_code'].upper()} #{num(c['collector_number'])} · {(c.get('rarity') or '').title()} · "
+                   f"{(c.get('released_at') or '')[:10]}{lang}")
+            p.text((x0 + 78, y + 22), sub, font="small", fill=MUTED, width=300)
+            p.text((x0 + 390, y + 3), " / ".join(finish_label(f) for f in self.screen.store.finishes_of(c)),
+                   font="small", fill=TEXT, width=lx1 - x0 - 400)
+            p.text((x0 + 390, y + 22), self.prices(c), font="small", fill=MUTED, width=lx1 - x0 - 400)
+            if c["id"] == self.row["scryfall_id"]:
+                p.text((lx1 - 8, y + 3), "current", font="label", fill=GREEN, anchor="ra")
+            p.hit((x0 + 24, y, lx1, y + rh - 4), ("print", c["id"]))
+            y += rh
+        if not self.shown:
+            p.text((x0 + 24, y + 10), "No printing matches that filter", font="body", fill=MUTED)
+        if len(self.shown) > self.VIS:
+            p.text((x0 + 24, y1 - 30), f"{self.scroll + 1}-{min(len(self.shown), self.scroll + self.VIS)} of "
+                                       f"{len(self.shown)} (mouse wheel or arrow keys)", font="small", fill=MUTED)
+        # preview + finish + apply
+        c = self.card()
+        px = lx1 + 24
+        if c:
+            if self._preview[0] != c["id"] or self._preview[1] is None or not self._preview[2]:
+                img = self.screen.large(dict(scryfall_id=c["id"], image_normal=c.get("image_normal")))
+                big = os.path.exists(os.path.join(LARGE_DIR, c["id"] + ".jpg"))
+                self._preview = (c["id"], img, big)  # re-read until the big picture has arrived
+            p.paste(self._preview[1], px, y0 + 50, 200, 279, radius=10)
+            py = y0 + 340
+            p.text((px, py), f"{c['set_code'].upper()} #{num(c['collector_number'])}", font="rowb")
+            py += 24
+            fx = px
+            for f in self.screen.store.finishes_of(c) or ["nonfoil"]:
+                w = p.f["label"].getlength(finish_label(f)) + 20
+                p.button((fx, py, fx + w, py + 26), finish_label(f), ("finish", f),
+                         style="selected" if f == self.finish else "ghost", font="label")
+                fx += w + 4
+            py += 34
+            v = self.screen.store.price_of(c, self.finish)
+            p.text((px, py), (self.screen.money(v) if v is not None else "no price") + " each", font="name",
+                   fill=GOLD if (v or 0) >= HIGH_VALUE else TEXT)
+            same = c["id"] == self.row["scryfall_id"] and self.finish == self.row["finish"]
+            p.button((px, y1 - 98, x1 - 24, y1 - 62), "Use this printing", ("use", None),
+                     style="disabled" if same else "primary")
+        p.button((px, y1 - 54, x1 - 24, y1 - 20), "Cancel", ("btn", None))
+        self.hits = p.hits
+        return p.to_bgr()
+
+    def click(self, x, y):
+        for x0, y0, x1, y1, a in reversed(self.hits):
+            if x0 <= x <= x1 and y0 <= y <= y1 and a:
+                kind, v = a
+                if kind == "print":
+                    if v == self.sel and self.last_click == v:
+                        return self.use()  # second click on the same printing = use it
+                    self.select(v)
+                    self.last_click = v
+                    return
+                if kind == "finish":
+                    self.finish = v
+                elif kind == "use":
+                    self.use()
+                elif kind == "btn":
+                    self.done = True
+                return
+
+    last_click = None
+    _preview = (None, None, False)
+
+    def use(self):
+        c = self.card()
+        if c is None:
+            return
+        self.done = True
+        r = self.row
+        if c["id"] == r["scryfall_id"] and self.finish == r["finish"]:
+            return
+        if c["id"] == r["scryfall_id"]:
+            self.screen.change(r, finish=self.finish)
+        else:
+            self.screen.change(r, scryfall_id=c["id"], finish=self.finish)
+
+    def wheel(self, delta):
+        self.scroll += -3 if delta > 0 else 3
+
+    def key(self, key):
+        ids = [c["id"] for c in self.shown]
+        if key == 27:
+            self.done = True
+        elif key == 13:
+            self.use()
+        elif key in (0x260000, 0x280000) and ids:
+            i = ids.index(self.sel) if self.sel in ids else 0
+            i = max(0, min(len(ids) - 1, i + (1 if key == 0x280000 else -1)))
+            self.select(ids[i])
+            self.scroll_to_sel()
+        elif key == 8:
+            self.text = self.text[:-1]
+            self.filter()
+        elif 32 <= key < 127:
+            self.text += chr(key)
+            self.filter()
 
 
 def num(cn):

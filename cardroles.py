@@ -11,7 +11,7 @@ import json
 import re
 from dataclasses import dataclass
 
-CLASSIFIER_VERSION = 7
+CLASSIFIER_VERSION = 11
 
 ROLES = [
     "Ramp", "Card Draw", "Removal", "Board Wipe", "Counterspell", "Protection", "Tutor", "Recursion",
@@ -19,6 +19,7 @@ ROLES = [
     "Lifegain", "Life Loss / Drain", "Mill", "Discard", "Blink / Flicker", "+1/+1 Counters", "Proliferate",
     "Equipment", "Auras", "Landfall", "Spellslinger", "Artifact Synergy", "Enchantment Synergy",
     "Creature Synergy", "Tribal / Typal Synergy", "Mana Sink", "Finisher", "Combo Piece", "Group Hug",
+    "Token Doubler", "Trigger Doubler", "Anthem", "Attack Triggers",
     "Land",
 ]
 
@@ -87,6 +88,8 @@ RULES = [
     Rule("Removal", r"fights? (?:target|another target|up to one target) creature", "fights a creature", 0.6),
     Rule("Board Wipe", r"(?:destroy|exile) all (?:creatures|nonland permanents|artifacts|enchantments|other "
                        r"creatures|permanents|planeswalkers|nonland)", "removes everything of a type", 0.95),
+    Rule("Board Wipe", r"(?:destroy|exile) each (?:other )?(?:artifact|creature|enchantment|nonland permanent|permanent)",
+         "destroys each permanent of some types", 0.85),
     Rule("Board Wipe", r"(?:all|each) (?:other )?creatures? (?:you don't control )?gets? -(?:\d+|x)/-(?:\d+|x)",
          "shrinks every creature", 0.85),
     Rule("Board Wipe", r"deals? (?:\d+|x) damage to each (?:creature|other creature|creature and each)",
@@ -144,6 +147,8 @@ RULES = [
     Rule("+1/+1 Counters", r"\+1/\+1 counters?", "uses +1/+1 counters", 0.8),
     Rule("+1/+1 Counters", r"one or more counters|twice that many [^.]*?counters|counters? on (?:each|a|target) "
                            r"permanent you control", "adds or doubles counters", 0.6),
+    Rule("+1/+1 Counters", r"double the number of (?:each kind of )?counters?|double the number of [^.]*?counters? on",
+         "doubles counters", 0.85),
     Rule("Proliferate", r"\bproliferate\b", "proliferates", 0.95),
     Rule("Equipment", r"\bequipped creature\b|\bequip\b|equipment (?:you control|spells)", "Equipment", 0.8),
     Rule("Auras", r"\benchanted creature\b|aura spells|auras? you control|enchant creature", "Auras", 0.75),
@@ -169,6 +174,37 @@ RULES = [
     Rule("Finisher", r"you win the game|each opponent loses (?:\d\d|half)|\binfect\b|additional combat phase|"
                      r"creatures you control get \+\d+/\+\d+ and gain trample|double (?:the )?damage|"
                      r"double that damage|loses the game", "can end the game", 0.75),
+    # --- engines that multiply what the deck already does
+    Rule("Token Doubler", r"twice that many (?:of those )?tokens|tokens? (?:would be created|are created)[^.]*?twice|"
+                          r"double the number of tokens|create (?:a|one) token that's a copy of (?:it|that token)|"
+                          r"for each token [^.]*?create a token that's a copy", "doubles / copies your tokens", 0.85),
+    Rule("Trigger Doubler", r"triggers? an additional time", "makes triggered abilities trigger twice", 0.85),
+    Rule("Anthem", r"(?:creatures|tokens|creature tokens) you control (?:get|have base power|that are [^.]*?get) \+?\d*|"
+                   r"other [a-z]+ (?:creatures )?you control get \+\d+/\+\d+|creatures you control of the chosen type get \+",
+         "pumps your whole team", 0.7),
+    Rule("Attack Triggers", r"whenever you attack|whenever (?:a|one or more|another) (?:[a-z-]+ )?creatures? you control "
+                            r"attacks?|whenever (?:this creature|this|it) attacks|tapped and attacking|"
+                            r"creature attacking causes a triggered ability", "rewards attacking", 0.7),
+    # --- extra ways to win (a card doesn't need to say "win the game")
+    Rule("Finisher", r"(?:whenever|at the beginning)[^.]*?(?:deals? \d+ damage to each opponent|each opponent loses \d+ life)",
+         "repeated damage / drain to every opponent", 0.7),
+    Rule("Finisher", r"(?:deals?|deal) (?:twice that much|double that|double the) damage|damage [^.]*?is doubled",
+         "doubles damage", 0.75),
+    Rule("Finisher", r"creatures you control (?:have|gain) (?:flying|menace|trample|skulk|shadow|horsemanship)|"
+                     r"creatures you control can't be blocked|(?:tokens|creatures) you control [^.]*?(?:have|gain) "
+                     r"(?:flying|menace|trample)", "evasion for your whole team", 0.6),
+    Rule("Finisher", r"damage equal to the number of (?:creatures|creature tokens|tokens|permanents) you control",
+         "damage that scales with a wide board", 0.6),
+    # --- more interaction / protection / tutors / draw
+    Rule("Removal", r"each player sacrifices (?:a|an|one) (?:creature|nonland permanent|permanent)",
+         "symmetrical edict (everyone sacrifices)", 0.55),
+    Rule("Protection", r"(?:your )?opponents can't cast spells during your turn|your opponents can't cast spells",
+         "opponents can't respond on your turn", 0.6),
+    Rule("Protection", r"prevent all (?:combat )?damage that would be dealt to (?:attacking )?creatures you control",
+         "protects your attackers", 0.7),
+    Rule("Tutor", r"reveal cards from the top of your library until you reveal (?:a|an) [^.]*?card[^.]*?put (?:that card|it) "
+                  r"into your hand", "digs for a specific card type", 0.6),
+    Rule("Card Draw", r"each player discards (?:their|his or her) hand,? (?:then|and) draws", "wheel (refills hands)", 0.8),
     Rule("Combo Piece", r"untap all (?:other )?(?:nonland )?permanents|untap target (?:artifact|permanent)[^.]*?"
                         r"\. |take an extra turn|copy target activated", "known combo-type effect", 0.4),
     Rule("Group Hug", r"each player (?:draws|may draw|may put a land|adds|gains)", "helps every player", 0.7),
@@ -243,15 +279,18 @@ def classify(card):
         landy = re.compile(r"land|forest|island|plains|swamp|mountain|gate|desert")
         if searches and all(landy.search(x) for x in searches):
             del out["Tutor"]  # searching for lands is ramp / fixing, not a tutor
-    if "Card Draw" in out and not _you_draw(text) and not re.search(r"exile the top|investigate|clue|into your hand",
-                                                                        text):
+    if "Card Draw" in out and out["Card Draw"].reason != "wheel (refills hands)" and not _you_draw(text) \
+            and not re.search(r"exile the top|investigate|clue|into your hand", text):
         del out["Card Draw"]  # e.g. "whenever an opponent draws a card"
     if "Removal" in out and out["Removal"].reason == "destroys or exiles a target":
         hits = re.findall(r"(?:destroy|exile) (?:target|another target|up to (?:one|two|\w+) target) ([^.]*)", text)
         if hits and all(("you control" in h and "don't control" not in h) or "graveyard" in h or "card from" in h
                         for h in hits):
             del out["Removal"]  # your own permanent (blink) or a card in a graveyard - not removal
-    for k, role, reason in (("hexproof", "Protection", "has hexproof"), ("indestructible", "Protection",
+    for k, role, reason in (("mobilize", "Token Generation", "makes attacking tokens (mobilize)"),
+                            ("mobilize", "Attack Triggers", "makes attacking tokens (mobilize)"),
+                            ("squad", "Token Generation", "squad copies"), ("myriad", "Attack Triggers", "myriad"),
+                            ("hexproof", "Protection", "has hexproof"), ("indestructible", "Protection",
                                                                         "is indestructible"),
                             ("proliferate", "Proliferate", "proliferates"), ("landfall", "Landfall", "landfall"),
                             ("lifelink", "Lifegain", "has lifelink (minor)"), ("infect", "Finisher", "has infect"),
@@ -272,6 +311,12 @@ def classify(card):
             del out["Removal"]
     if "Removal" in out and re.search(r"\boverload\b", text):
         add("Board Wipe", 0.7, "overload turns it into a one-sided wipe")
+    if "Board Wipe" in out:
+        # "exile all creatures YOU control" (Mass Polymorph, Synthetic Destiny) transforms your
+        # own board - it isn't a wipe. Only keep the wipe if some wipe text isn't self-only.
+        wipes = re.findall(r"(?:destroy|exile|return) (?:all|each) [^.;•]*", text)
+        if wipes and all("you control" in w and "don't control" not in w for w in wipes):
+            del out["Board Wipe"]
     return out
 
 

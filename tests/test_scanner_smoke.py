@@ -52,6 +52,8 @@ def slow_key(ms):
     return -1
 scanner.cv2.waitKeyEx = slow_key
 s.last_frame = frames[0]; s.capture_background(frames[0])
+assert s.auto_scan is False  # starts OFF
+s.set_auto_scan(True)        # Start Scan
 s.run()
 got = [s.db.by_id(e["id"])["name"] for e in s.entries]
 print("scanned:", got, "review pending:", s.review is not None, "frames drawn:", len(shown))

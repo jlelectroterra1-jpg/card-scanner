@@ -96,6 +96,7 @@ class DeckWorkflowTest(unittest.TestCase):
         s.last_frame = lit(self.mat)
         if s.background is None:
             s.learn_background()
+        s.set_auto_scan(True)  # Start Scan (scanning starts OFF)
         return s
 
     def printing_with_image(self, s, name):
@@ -204,10 +205,9 @@ class DeckWorkflowTest(unittest.TestCase):
             self.scan(s, cards[n])
         self.scan(s, cards["Island"])  # basic lands: no warning
         self.assertIsNone(s.dialog)
-        self.scan(s, cards["Sol Ring"])  # a duplicate: asked, not dropped
-        self.assertEqual(s.dialog.title, "Duplicate detected")
-        self.assertEqual(sum(1 for e in s.target.entries if e["name"] == "Sol Ring"), 2)
-        self.answer(s, "remove")
+        self.scan(s, cards["Sol Ring"])  # a duplicate: ignored automatically, no pop-up
+        self.assertIsNone(s.dialog)
+        self.assertIn("Duplicate ignored: Sol Ring", s.status)
         self.assertEqual(sum(1 for e in s.target.entries if e["name"] == "Sol Ring"), 1)
         self.assertEqual(s.panel_view()[0]["deck_mode"]["count"], 8)
 

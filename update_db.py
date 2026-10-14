@@ -75,7 +75,10 @@ def build():
         CREATE TABLE oracle_cards (
             oracle_id TEXT PRIMARY KEY, name TEXT, mana_cost TEXT, cmc REAL, type_line TEXT,
             oracle_text TEXT, keywords TEXT, power TEXT, toughness TEXT, color_identity TEXT,
-            legal_commander TEXT, game_changer INTEGER
+            legal_commander TEXT, game_changer INTEGER,
+            -- Scryfall's documented edhrec_rank (overall Commander popularity; 1 = most played).
+            -- Only a minor, optional signal for the analyser - never the definition of quality.
+            edhrec_rank INTEGER
         );
     """)
     rows, names, oracle = [], set(), {}
@@ -110,7 +113,8 @@ def build():
                                c.get("type_line") or " // ".join(f.get("type_line", "") for f in faces), text or "",
                                json.dumps(c.get("keywords") or []), c.get("power") or front.get("power"),
                                c.get("toughness") or front.get("toughness"), "".join(c.get("color_identity") or []),
-                               (c.get("legalities") or {}).get("commander"), int(bool(c.get("game_changer"))))
+                               (c.get("legalities") or {}).get("commander"), int(bool(c.get("game_changer"))),
+                               c.get("edhrec_rank"))
             # The scanner reads the name printed at the top of the card, which for
             # split / double-faced cards is just one face, so index every face name.
             names.add((c["name"], c["name"]))
@@ -124,7 +128,7 @@ def build():
                     names.add((alt, c["name"]))
     db.executemany("INSERT OR REPLACE INTO cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     db.executemany("INSERT INTO names VALUES (?,?)", sorted(names))
-    db.executemany("INSERT INTO oracle_cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", list(oracle.values()))
+    db.executemany("INSERT INTO oracle_cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", list(oracle.values()))
     db.executescript("CREATE INDEX idx_name ON cards(name); CREATE INDEX idx_set ON cards(set_code); "
                      "CREATE INDEX idx_oracle ON cards(oracle_id); CREATE INDEX idx_oracle_name ON oracle_cards(name);")
     db.commit()

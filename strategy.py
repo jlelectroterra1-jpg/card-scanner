@@ -12,7 +12,10 @@ import cardroles
 THEMES = {
     "Counters": dict(roles=["+1/+1 Counters", "Proliferate"], cues=[r"\+1/\+1 counter", r"\bcounters?\b"]),
     "Proliferate": dict(roles=["Proliferate", "+1/+1 Counters"], cues=[r"\bproliferate\b"]),
-    "Tokens": dict(roles=["Token Generation", "Creature Synergy"], cues=[r"\btokens?\b", r"\bpopulate\b"]),
+    "Tokens": dict(roles=["Token Generation", "Creature Synergy", "Token Doubler", "Anthem"],
+                   cues=[r"\btokens?\b", r"\bpopulate\b"]),
+    "Combat": dict(roles=["Attack Triggers", "Anthem"], cues=[r"whenever you attack", r"whenever [^.]*attacks",
+                                                              r"tapped and attacking", r"combat damage"]),
     "Aristocrats": dict(roles=["Sacrifice Outlet", "Aristocrats", "Life Loss / Drain"],
                         cues=[r"\bsacrifice\b", r"\bdies\b", r"\bdying\b"]),
     "Graveyard": dict(roles=["Graveyard Enabler", "Recursion", "Reanimation"],
@@ -72,10 +75,11 @@ def card_themes(card, roles=None):
     return out
 
 
-def detect(commanders, deck_cards=()):
+def detect(commanders, deck_cards=(), core_cards=()):
     """commanders / deck_cards: card dicts (oracle_text, type_line, keywords, ...).
+    core_cards: cards YOU marked as core to this deck - strong evidence of what it's for.
     Returns dict(primary=[...], secondary=[...], scores={theme: score}, reasons={theme: [..]},
-    tribe=<creature type or None>). Commander evidence counts most."""
+    tribe=<creature type or None>). Commander evidence counts most, then your core cards."""
     scores, reasons = Counter(), {}
 
     def note(theme, w, why):
@@ -99,6 +103,10 @@ def detect(commanders, deck_cards=()):
         for t in TYPES:
             if cares_about_type(text, t):
                 tribe_votes[t] += 8
+    for c in core_cards:  # your own "this card is what the deck is about"
+        roles = cardroles.classify(c)
+        for theme, w in card_themes(c, roles).items():
+            note(theme, 2.0 * w, f"you marked {c['name']} as a core card")
     # The deck: what do the other cards lean towards?
     deck_theme = Counter()
     n = 0

@@ -276,17 +276,16 @@ class ScanSessionTests(DeckBase):
         self.assertIsNone(t.add(None, dict(id=island["id"], finish="nonfoil"), island))
         self.assertIsNone(t.add(None, dict(id=island["id"], finish="nonfoil"), island))  # basics: fine
         dup = t.add(None, dict(id=sol["id"], finish="nonfoil"), sol)
-        self.assertEqual((dup["name"], dup["count"], dup["limit"]), ("Sol Ring", 2, 1))  # flagged, not dropped
-        self.assertEqual(len(t.entries), 5)
+        self.assertEqual((dup["rejected"], dup["name"], dup["count"], dup["limit"]), (True, "Sol Ring", 1, 1))
+        self.assertEqual(len(t.entries), 4)  # the second Sol Ring was not added
         st = t.stats(lookup)
-        self.assertEqual(st["count"], 5)  # commander (already in the deck) + Sol Ring x2 + Island x2
+        self.assertEqual(st["count"], 4)  # commander (already in the deck) + Sol Ring + Island x2
         self.assertEqual(st["commander"], "Atraxa, Praetors' Voice")
         # "the app closed": a new session for the same deck picks up where it left off
         data = DeckScanTarget.load(path)
-        self.assertEqual((data["deck_id"], len(data["entries"])), (deck, 5))
+        self.assertEqual((data["deck_id"], len(data["entries"])), (deck, 4))
         t2 = DeckScanTarget(path, deck, "Test Deck", self.st, data=data)
-        self.assertEqual(t2.stats(lookup)["count"], 5)
-        t2.entries.pop()  # remove the duplicate
+        self.assertEqual(t2.stats(lookup)["count"], 4)
         rep = self.st.finish_scan(deck, t2.entries)
         self.assertEqual(rep["added"], 4)
         rows = {r["card_name"]: r for r in self.st.deck_cards(deck)}

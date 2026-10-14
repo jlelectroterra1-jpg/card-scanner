@@ -7,20 +7,31 @@ analyse(udb, store, deck_id, settings) works through:
   4. scoring: every card gets separate components (commander synergy, strategy, role
      need, mana efficiency, interaction with the deck, general quality) - kept so each
      suggestion can explain itself; the weighted total depends on the deck goal
-  5. possible cuts: lowest-scoring non-commander, non-land cards, with reasons
+  5. cut review: every card gets itemised CUT EVIDENCE (off-plan, redundant function,
+     inefficient vs same-function cards, illegal, self-defeating wipe...) and itemised
+     PROTECTION (Game Changer, staple, commander/deck interactions from the synergy graph,
+     strategy support, engine, unique function, sole role, finisher, "we don't understand
+     it", your own pins). Only clear evidence that outweighs protection makes a cut.
   6. replacements: staged filtering of legal cards (legal -> colour identity -> relevant
-     role/theme -> owned & free / budget -> scoring), paired with cuts
-  7. a package of swaps within the budget, each with plain-English reasons + confidence
+     role/theme -> owned & free / budget -> scoring) with a separate replacement confidence;
+     a replacement must be able to do the OUT card's job (same function, see synergy.py)
+  7. swaps only where cut AND replacement confidence are both high enough (the package size
+     is a maximum, never a target); good additions without a confident cut are listed as
+     "cards worth considering"
 Nothing changes a deck until apply_swaps() is called (which snapshots first; undo_last()
 puts it back)."""
 import hashlib
 import json
+import os
+import re
 import time
 from collections import Counter
 
 import cardroles
 import deckrules
+import commander
 import strategy
+import synergy
 
 # ---------------------------------------------------------------- guidance (edit freely)
 
@@ -39,8 +50,6 @@ GUIDELINES = {
     "Finisher": {"casual": (2, 6), "improve": (2, 5), "high": (1, 4)},
 }
 AVG_MV_TARGET = {"casual": 3.6, "improve": 3.3, "high": 2.9}
-PACKAGE_SIZE = {"casual": 4, "improve": 7, "high": 10}
-MIN_GAIN = {"casual": 0.10, "improve": 0.08, "high": 0.06}
 # All Cards mode: cards you'd have to BUY must show some sign of being widely played -
 # printed in a few sets or in a Commander product (local Scryfall data). Owned cards are exempt.
 MIN_REPRINT_SCORE = 0.5
@@ -54,7 +63,7 @@ IDEAL_MV = {"Ramp": 2, "Card Draw": 3, "Removal": 2, "Board Wipe": 4, "Countersp
 NARROW = {"Graveyard Hate", "Mill", "Discard", "Group Hug", "Lifegain"}
 COMPONENT_LABELS = dict(commander="Commander synergy", strategy="Deck strategy", need="Fills a needed role",
                         efficiency="Mana efficiency", interaction="Works with the deck", quality="General strength")
-ANALYSER_VERSION = 4
+ANALYSER_VERSION = 7
 
 
 # ---------------------------------------------------------------- card data
@@ -72,11 +81,17 @@ class CardData:
                                              color_identity, legal_commander, game_changer FROM scry.oracle_cards"""):
             self.cards[r["name"]] = dict(r)
         self.roles = self._load_roles(progress)
+        # Optional, minor signal: Scryfall's documented edhrec_rank (overall Commander popularity).
+        # Present once Update Prices has rebuilt cards.db with it; never the definition of quality.
+        cols = {r[1] for r in self.conn.execute("PRAGMA scry.table_info(oracle_cards)")}
+        self.popularity = {r[0]: r[1] for r in self.conn.execute(
+            "SELECT name, edhrec_rank FROM scry.oracle_cards WHERE edhrec_rank IS NOT NULL")} \
+            if "edhrec_rank" in cols else {}
         self.prices = {r[0]: r[1] for r in self.conn.execute(
             """SELECT name, MIN(CAST(usd AS REAL)) FROM scry.cards WHERE usd IS NOT NULL AND lang = 'en'
                GROUP BY name""")}
-        # How widely a card has been (re)printed - especially in Commander products - is a
-        # rough, local signal of how playable it is (Scryfall data, nothing from EDHREC).
+        # How often a card has been printed: METADATA only - used to keep obscure cards out of
+        # "buy this" suggestions when no popularity data exists. Not a measure of card quality.
         import math
         self.reprints = {}
         for r in self.conn.execute(
@@ -141,7 +156,9 @@ def fingerprint(udb, deck_id, settings, stamp=""):
                                      FROM collection_items""").fetchone())
     alloc = tuple(udb.conn.execute("""SELECT COUNT(*), COALESCE(SUM(quantity), 0), COALESCE(SUM(collection_item_id), 0)
                                       FROM deck_cards WHERE collection_item_id IS NOT NULL""").fetchone())
-    blob = json.dumps([ANALYSER_VERSION, deck, coll, alloc, settings, stamp], sort_keys=True, default=str)
+    pins = sorted(tuple(r) for r in udb.conn.execute(
+        "SELECT card_name, flag FROM deck_card_flags WHERE deck_id = ?", (deck_id,)))
+    blob = json.dumps([ANALYSER_VERSION, deck, coll, alloc, settings, stamp, pins], sort_keys=True, default=str)
     return hashlib.sha1(blob.encode()).hexdigest()
 
 
@@ -169,8 +186,9 @@ class Context:
             info = cd.info(c["card_name"]) or {}
             for t, w in strategy.card_themes(info, cd.roles.get(info.get("name"), {})).items():
                 self.commander_themes[t] = max(self.commander_themes.get(t, 0), w)
-        for t in detected["primary"]:
-            self.commander_themes[t] = max(self.commander_themes.get(t, 0), 0.8)
+        if not tags:  # your own strategy tags win: detected themes don't get a say then
+            for t in detected["primary"]:
+                self.commander_themes[t] = max(self.commander_themes.get(t, 0), 0.8)
         self.ownership = ownership
         self.counts = Counter()
         self.theme_counts = Counter()
@@ -186,7 +204,12 @@ class Context:
         self.counts["Lands"] = sum(r["quantity"] for r in self.cards
                                    if "Land" in (r.get("type_line") or "").split(" // ")[0])
 
+    targets = {}   # deck-specific target ranges (deck_targets), filled in by prepare()
+    profile = None  # commander profile (commander.py)
+
     def guideline(self, role):
+        if role in self.targets:
+            return self.targets[role]
         if role == "Counterspell" and "U" not in self.identity:
             return None
         g = GUIDELINES.get(role)
@@ -205,15 +228,19 @@ class Context:
         return bool(g and (counts or self.counts)[role] > g[1])
 
 
-STAPLE_PRICE = 8.0  # USD: a card this sought-after is rarely the weak link
+def _obscure(cd, name):
+    """Rarely played: by Scryfall's EDHREC rank when known, else (metadata only) rarely printed."""
+    rank = cd.popularity.get(name)
+    if rank is not None:
+        return rank > 15000
+    return cd.reprints.get(name, 0) < 0.5  # no popularity data yet (run Update Prices): stricter filter
 
 
 def is_staple(ctx, s):
-    """Strong cards we never offer as cuts in Improve / High Power: Wizards' Game Changer list
-    (Scryfall data) or a widely reprinted card that still costs a lot (local price data)."""
+    """Official Game Changer, or (when the data is there) one of the most played Commander cards."""
     name = s["info"].get("name") or s["name"]
-    price = ctx.cd.prices.get(name) or 0
-    return bool(s["info"].get("game_changer")) or (price >= STAPLE_PRICE and ctx.cd.reprints.get(name, 0) >= 0.5)
+    rank = ctx.cd.popularity.get(name)
+    return bool(s["info"].get("game_changer")) or (rank is not None and rank <= 250)
 
 
 def score(ctx, name, counts=None, in_deck=False):
@@ -236,10 +263,16 @@ def score(ctx, name, counts=None, in_deck=False):
     share = sum(ctx.theme_counts.get(t, 0) - (1 if in_deck else 0) for t in themes if t in ctx.themes)
     comp["interaction"] = min(1.0, max(0.0, share) / 20)
     useful = [r for r in roles if r != "Land"]
-    q = 0.1 * min(3, len(useful)) + 0.15 * max([v.confidence for v in roles.values()] + [0])
-    q += 0.45 * cd.reprints.get(info.get("name") or name, 0)
-    if any("every time" in v.reason or "repeat" in v.reason for v in roles.values()):
+    # General strength from what the card DOES (jobs, how sure we are, repeatable engine) -
+    # price and print count are not quality. Popularity (EDHREC rank via Scryfall) is a small
+    # optional extra when present.
+    q = 0.2 * min(3, len(useful)) + 0.35 * max([v.confidence for v in roles.values()] + [0])
+    if synergy.is_engine(info, roles):
         q += 0.15
+    rank = cd.popularity.get(info.get("name") or name)
+    if rank:
+        import math
+        q += 0.15 * max(0.0, 1 - math.log10(rank) / 4.5)
     if info.get("game_changer"):
         q += 0.35 if ctx.goal == "high" else 0.1
     comp["quality"] = min(1.0, q)
@@ -285,7 +318,7 @@ def composition(ctx):
                 core={r: ctx.counts.get(r, 0) for r in GUIDELINES if ctx.guideline(r)})
 
 
-def weaknesses(ctx, comp):
+def weaknesses(ctx, comp, targets=None):
     out = []
     for role in GUIDELINES:
         g = ctx.guideline(role)
@@ -293,13 +326,17 @@ def weaknesses(ctx, comp):
             continue
         have = comp["lands"] if role == "Lands" else ctx.counts.get(role, 0)
         label = "lands" if role == "Lands" else f"{role.lower()} cards" if role not in ("Ramp", "Removal") else role.lower()
-        if have < g[0]:
-            out.append(dict(role=role, kind="low", have=have, range=g,
-                            text=f"Only {have} {label} - many {GOALS[ctx.goal].lower()} Commander decks run about "
-                                 f"{g[0]}-{g[1]}"))
-        elif have > g[1] and role in ("Lands", "Finisher", "Board Wipe", "Tutor"):
+        why = "; ".join((targets or {}).get(role, {}).get("why", []))
+        tgt = f"{g[0]}-{g[1]} for this deck" + (f" ({why})" if why else "")
+        if role == "Finisher" and have == 0:
+            out.append(dict(role=role, kind="low", have=0, range=g,
+                            text="No obvious dedicated finisher detected - check how the deck closes games "
+                                 f"(target {tgt})"))
+        elif have < g[0]:
+            out.append(dict(role=role, kind="low", have=have, range=g, text=f"Only {have} {label} - target {tgt}"))
+        elif have > g[1] and role in ("Lands", "Board Wipe"):
             out.append(dict(role=role, kind="high", have=have, range=g,
-                            text=f"{have} {label} - more than the usual {g[0]}-{g[1]}; a slot or two could do other jobs"))
+                            text=f"{have} {label} - more than the {tgt}; a slot or two could do other jobs"))
     target = AVG_MV_TARGET[ctx.goal]
     if comp["avg_mv"] > target + 0.25:
         out.append(dict(role="Curve", kind="high", have=comp["avg_mv"], range=(0, target),
@@ -335,34 +372,6 @@ def ownership_map(udb, deck_id):
     return out
 
 
-def candidate_pool(ctx, deck_names, mode):
-    """Stage 1-4 filtering: legal, in colour identity, not in the deck, relevant to a
-    role/theme, and owned & free (My Collection) - cheap checks before scoring."""
-    cd, allowed = ctx.cd, set(ctx.identity)
-    want_roles = {r for r in GUIDELINES if ctx.guideline(r) and not ctx.surplus(r)}
-    out = []
-    for name, info in cd.cards.items():
-        if info["legal_commander"] != "legal" or name in deck_names:
-            continue
-        if not set(info["color_identity"] or "") <= allowed:
-            continue
-        front = (info["type_line"] or "").split(" // ")[0]
-        if "Land" in front or deckrules.is_basic(name, info["type_line"]):
-            continue
-        own = ctx.ownership.get(name)
-        if mode == "collection" and not (own and own["free"] > 0):
-            continue
-        if mode == "all" and not own and cd.reprints.get(name, 0) < MIN_REPRINT_SCORE:
-            continue  # unowned and rarely printed: too obscure to suggest buying
-        roles = cd.roles.get(name, {})
-        themes = strategy.card_themes(info, roles)
-        relevant = (want_roles & set(roles)) or (set(themes) & set(ctx.themes)) or (
-            ctx.tribe and ctx.tribe in cardroles.creature_types(info["type_line"]))
-        if relevant:
-            out.append(name)
-    return out
-
-
 def ownership_of(ctx, name):
     own = ctx.ownership.get(name)
     price = ctx.cd.prices.get(name)
@@ -376,185 +385,540 @@ def ownership_of(ctx, name):
     return dict(status="not_owned", label="Not owned", free=0, cost=price, price=price)
 
 
-def explain(ctx, out_s, in_s, counts_before):
-    """Plain-English reasons + confidence for one swap."""
-    why_out, why_in = [], []
-    themes_txt = ", ".join(list(ctx.themes)[:2]) or "current"
-    if out_s["comp"]["commander"] < 0.2 and out_s["comp"]["strategy"] < 0.2:
-        why_out.append(f"Lower synergy with your {themes_txt} plan")
-    surplus = [r for r in out_s["core"] if ctx.surplus(r, counts_before)]
-    for r in surplus[:1]:
-        g = ctx.guideline(r)
-        why_out.append(f"The deck already has {counts_before[r]} {r.lower()} cards (typical {g[0]}-{g[1]}), so this "
-                       "slot may be doing less work than alternatives")
-    if out_s["comp"]["efficiency"] < 0.6 and out_s["cmc"] >= 5:
-        why_out.append(f"Costs {int(out_s['cmc'])} mana - on the expensive side for what it does here")
-    if not out_s["roles"]:
-        why_out.append("We couldn't detect a clear job for it in this deck (it may be there for a reason we can't see)")
-    if not why_out:
-        why_out.append("Scores lowest of your non-land cards for this deck's plan")
+# ---------------------------------------------------------------- deck understanding
+#
+# COMMANDER -> STRATEGY -> ENGINES / SYNERGIES -> CARD FUNCTIONS -> DECK NEEDS ->
+# WEAK / REDUNDANT PIECES -> POSSIBLE UPGRADES -> SAFE SWAPS.
+# A card is only suggested as a cut when there is POSITIVE evidence that it may be
+# replaceable, and that evidence clearly outweighs everything that makes it important.
+# Not understanding a card is protection, not evidence. Every item keeps its reason.
 
-    shared = [r for r in in_s["core"] if r in out_s["core"]]
-    for r in shared[:1]:
-        line = f"Also does {r.lower()} ({in_s['roles'][r].reason})"
-        if in_s["cmc"] < out_s["cmc"]:
-            line += f" for {int(out_s['cmc'] - in_s['cmc'])} less mana"
-        why_in.append(line)
-    for r in in_s["core"]:
-        if r in shared:
+MIN_EVIDENCE = 0.9     # a cut needs at least this much evidence...
+MIN_MARGIN = 0.6       # ...and this much more evidence than protection
+STRATEGY_SURE = 4.5    # detected primary theme score needed to call the strategy clear
+GO_WIDE_PLANS = {"Tokens", "Combat", "Creatures", "Tribal", "Aristocrats"}
+
+
+def strategy_certainty(detected, user_tags):
+    """(uncertain?, why). Your own strategy tags are always taken as certain."""
+    if user_tags:
+        return False, "you chose the strategy"
+    scores = sorted(detected.get("scores", {}).values(), reverse=True)
+    if not detected.get("primary") or not scores:
+        return True, "no clear strategy detected"
+    s1 = scores[0]
+    s3 = scores[2] if len(scores) > 2 else 0
+    if s1 < STRATEGY_SURE:
+        return True, "the detected strategy is weak"
+    if s3 and s1 < 1.3 * s3:
+        return True, "several strategies score about the same"
+    return False, "clear"
+
+
+def deck_targets(ctx, comp, prof, graph):
+    """Generic guideline ranges adjusted to THIS deck (curve, commander cost, what the
+    commander does itself, the plan) - each change with its reason."""
+    goal, avg = ctx.goal, comp["avg_mv"]
+    cmd_mv = max([float((ctx.cd.info(c["card_name"]) or {}).get("cmc") or 0) for c in ctx.commanders] or [0])
+    mech = {m["key"] for m in prof["mechanics"]}
+    plan = prof.get("primary")
+    # main plans only: a theme detected just from the deck's own wipes shouldn't raise the wipe target
+    plans = {plan, *(prof.get("supporting") or [])[:2]} | {t for t, w in ctx.themes.items() if w >= 1.0}
+    repeat_draw = sum(1 for n, (i, r) in graph.cards.items() if n not in graph.commanders and set(
+        synergy.functions(i, r).get("Card Draw", [])) & synergy.ENGINE_SUBTYPES)
+    out = {}
+    for role, by_goal in GUIDELINES.items():
+        if role == "Counterspell" and "U" not in ctx.identity:
             continue
-        if ctx.need(r, counts_before) > 0.15:
-            g = ctx.guideline(r)
-            why_in.append(f"Adds {r.lower()}: the deck has only {counts_before[r]} (many decks run {g[0]}-{g[1]})")
+        lo, hi = by_goal[goal]
+        why = []
+        if role in ("Ramp", "Lands"):
+            if avg and avg <= 2.8:
+                lo, hi = lo - 2, hi - 2
+                why.append(f"low average mana value ({avg:.2f})")
+            elif avg and avg <= 3.1:
+                lo, hi = lo - 1, hi - 1
+                why.append(f"fairly low average mana value ({avg:.2f})")
+            elif avg >= 3.8:
+                lo, hi = lo + 1, hi + 2
+                why.append(f"high average mana value ({avg:.2f})")
+            if role == "Ramp" and cmd_mv >= 6:
+                lo, hi = lo + 1, hi + 1
+                why.append(f"the commander costs {int(cmd_mv)}")
+            elif role == "Ramp" and cmd_mv and cmd_mv <= 3:
+                why.append(f"the commander costs only {int(cmd_mv)}")
+        if role == "Card Draw":
+            if "draw" in mech:
+                lo, hi = lo - 2, hi - 2
+                why.append("the commander draws cards itself")
+            if repeat_draw >= 3:
+                lo, hi = lo - 1, hi - 1
+                why.append(f"{repeat_draw} repeatable draw engines already")
+        if role == "Removal":
+            if "removal" in mech:
+                lo, hi = lo - 1, hi - 1
+                why.append("the commander provides removal")
+            if "Control" in plans:
+                lo, hi = lo + 1, hi + 1
+                why.append("control plan")
+        if role == "Board Wipe":
+            if plans & GO_WIDE_PLANS and "Control" not in plans:
+                lo, hi = max(0, lo - 1), max(1, hi - 1)
+                why.append("wipes also hit your own wide board")
+            elif "Control" in plans:
+                lo, hi = lo + 1, hi + 1
+                why.append("control plan")
+        if role == "Protection":
+            if "Voltron" in plans:
+                lo, hi = lo + 2, hi + 2
+                why.append("voltron: the commander must survive")
+            elif plans & GO_WIDE_PLANS:
+                lo, hi = lo + 1, hi + 1
+                why.append("a wide board needs protection from wipes")
+        if role == "Finisher" and mech & {"damage", "wide"}:
+            lo, hi = max(0, lo - 1), max(1, hi - 1)
+            why.append("the commander can close games itself")
+        if role == "Recursion" and plans & {"Graveyard", "Reanimator"}:
+            lo, hi = lo + 1, hi + 2
+            why.append("graveyard plan")
+        lo = max(0, lo)
+        out[role] = dict(generic=list(by_goal[goal]), target=[lo, max(lo, hi)], why=why)
+    return out
+
+
+def analysis_confidence(prof, review_rows, uncertain, uncertain_why):
+    """How far to trust the recommendations: commander understanding, strategy certainty
+    and how many cards the analyser actually understands."""
+    total = len(review_rows)
+    understood = sum(1 for v in review_rows if v["understood"])
+    cov = understood / total if total else 1.0
+    levels = {"HIGH": 2, "MEDIUM": 1, "LOW": 0}
+    reasons, parts = [], {}
+    cu = prof.get("understanding", 0)
+    parts["commander"] = "HIGH" if cu >= 0.75 else "MEDIUM" if cu >= 0.5 else "LOW"
+    if parts["commander"] != "HIGH":
+        reasons.append(f"only {prof.get('understood')}/{prof.get('clauses')} of the commander's rules text was "
+                       "interpreted")
+    parts["strategy"] = "MEDIUM" if uncertain else "HIGH"
+    if uncertain:
+        reasons.append(f"strategy uncertain ({uncertain_why})")
+    parts["coverage"] = "HIGH" if cov >= 0.88 else "MEDIUM" if cov >= 0.75 else "LOW"
+    if parts["coverage"] != "HIGH":
+        poor = [v["name"] for v in review_rows if not v["understood"]]
+        reasons.append(f"{total - understood} of {total} cards poorly understood (e.g. {', '.join(poor[:4])})")
+    overall = min(parts.values(), key=lambda p: levels[p])
+    return dict(overall=overall, commander=parts["commander"], strategy=parts["strategy"],
+                coverage=parts["coverage"], understood=understood, total=total, reasons=reasons)
+
+
+def _func_counts(ctx, graph_cards):
+    counts = Counter()
+    for name, (info, roles) in graph_cards.items():
+        if name in {c["card_name"] for c in ctx.commanders}:
+            continue
+        for f in synergy.flat_functions(info, roles):
+            counts[f] += 1
+    return counts
+
+
+def review_card(ctx, st, name, info, roles):
+    """Cut evidence vs protection for one deck card (with the deck's engines, the
+    commander plan and your own feedback)."""
+    graph, func_counts, counts, flags = st.graph, st.func_counts, st.counts, st.flags.get(name, set())
+    s = score(ctx, name, counts, in_deck=True)
+    ev, prot = [], []
+    strong = graph.count(name, strengths=("strong",))
+    moderate = graph.count(name, strengths=("moderate",))
+    n_links = strong + moderate
+    cmd_links = graph.with_commander(name)
+    cmd_strength = graph.commander_strength(name)
+    links = graph.interactions(name)
+    engines = graph.engines_of(name)
+    funcs = synergy.functions(info, roles)
+    core = [r for r in roles if r in GUIDELINES and roles[r].confidence >= 0.5]
+    cmc = float(info.get("cmc") or 0)
+    understood = any(v.confidence >= 0.6 for r, v in roles.items() if r != "Land")
+    # a big body whose ONLY recognised trait is size (e.g. Colossal Dreadmaw) - never a card the
+    # analyser simply failed to understand
+    vanilla_body = ("Creature" in (info.get("type_line") or "") and cmc >= 5
+                    and set(roles) == {"Finisher"} and all(v.confidence <= 0.55 for v in roles.values()))
+    base = dict(name=name, understood=understood or vanilla_body, links=n_links, strong=strong, moderate=moderate,
+                commander_synergy=cmd_strength or "none", engines=engines, flags=sorted(flags),
+                roles=sorted(r for r in roles if r != "Land"),
+                functions=sorted(f for subs in funcs.values() for f in subs), score=s)
+    if "never_cut" in flags:
+        return dict(base, status="pinned", evidence=[], protection=[("You protected this card from cuts", 99.0)],
+                    E=0.0, P=99.0, cut_confidence=0.0, eligible=False, verdict="KEEP - you protected it")
+    plan = ctx.profile.get("primary_name") if ctx.profile else None
+    # ---- evidence that it may be replaceable
+    if info.get("legal_commander") not in (None, "legal"):
+        ev.append(("Not legal in Commander", 3.0))
+    if not set(info.get("color_identity") or "") <= set(ctx.identity):
+        ev.append((f"Outside your commander's colours ({info.get('color_identity')})", 3.0))
+    if "not_important" in flags:
+        ev.append(("You marked it as not important", 0.3))
+    has_job = any(r != "Finisher" or roles[r].confidence > 0.55 for r in core)
+    if understood and not has_job and s["comp"]["commander"] < 0.1 and s["comp"]["strategy"] < 0.1 \
+            and strong == 0 and n_links <= 1 and not cmd_links and not engines:
+        ev.append((f"No clear deck job (ramp, draw, removal...) and nothing to do with {plan or 'the plan'}; "
+                   "no interactions with other cards", 0.4 if st.uncertain else 1.0))
+    elif vanilla_body and s["comp"]["commander"] < 0.1 and n_links <= 1 and not cmd_links and not engines:
+        ev.append((f"A {int(cmc)}-mana creature whose only job is attacking, with no link to your commander or "
+                   "other cards", 0.4 if st.uncertain else 1.0))
+    one_sided = "asymmetric wipe" in funcs.get("Board Wipe", [])
+    for role in core:
+        g = ctx.guideline(role)
+        if not g or counts[role] <= g[1] or role == "Finisher":  # many ways to win is never a problem
+            continue
+        sub = next((x for x in funcs.get(role, [role.lower()]) if func_counts[(role, x)] - 1 >= 3), None)
+        over = counts[role] - g[1]
+        if sub:
+            ev.append((f"{func_counts[(role, sub)] - 1} other cards already do {sub} (the deck has {counts[role]} "
+                       f"{role.lower()} cards; target for this deck {g[0]}-{g[1]})", 0.8 if over >= 2 else 0.6))
             break
-    cmd_themes = [t for t in in_s["themes"] if ctx.commander_themes.get(t, 0) >= 0.5]
-    if cmd_themes:
-        names = " + ".join(c["card_name"].split(",")[0] for c in ctx.commanders) or "your commander"
-        why_in.append(f"Works with {names}'s {cmd_themes[0].lower()} theme")
-    elif any(t in ctx.themes for t in in_s["themes"]):
-        t = next(t for t in in_s["themes"] if t in ctx.themes)
-        why_in.append(f"Fits the {t.lower()} strategy {'you chose' if ctx.user_tags else 'the deck seems to have'}")
-    if ctx.tribe and ctx.tribe in cardroles.creature_types(in_s["info"].get("type_line")):
-        why_in.append(f"Is a {ctx.tribe} - {ctx.tribe_count} of your cards are too")
-    elif in_s["comp"]["interaction"] >= 0.3:
-        t = max((t for t in in_s["themes"] if t in ctx.themes), key=lambda t: ctx.theme_counts.get(t, 0), default=None)
-        if t and ctx.theme_counts.get(t, 0) >= 2:
-            why_in.append(f"Works with {ctx.theme_counts.get(t, 0)} cards already in the deck that care about "
-                          f"{t.lower()}")
-    if in_s["cmc"] + 1 < out_s["cmc"] and not shared:
-        why_in.append(f"Costs {int(out_s['cmc'] - in_s['cmc'])} less mana, lowering the curve")
-    if not why_in:
-        why_in.append("Scores higher for this deck's roles and plan")
+        if over >= 2 and not (role == "Board Wipe" and one_sided) and len(core) == 1:
+            ev.append((f"The deck has {counts[role]} {role.lower()} cards - {over} more than the {g[0]}-{g[1]} "
+                       "this deck needs", 0.5))
+            break
+    reduces_itself = re.search(r"costs? \{?\d+\}? less|\bconvoke\b|\bdelve\b|\bimprovise\b|\baffinity\b|"
+                               r"\bundaunted\b|\bemerge\b|without paying its mana cost",
+                               cardroles.normalise_text(info.get("oracle_text"), name))
+    for role in core:
+        ideal = IDEAL_MV.get(role)
+        if ideal is None or cmc < ideal + 2 or reduces_itself:
+            continue
+        subs = set(funcs.get(role, [role.lower()]))
+        sub = sorted(subs)[0]
+        cheaper = [n for n, (i2, r2) in graph.cards.items() if n != name and role in r2
+                   and subs <= {x for rr, x in synergy.flat_functions(i2, r2) if rr == role}
+                   and float(i2.get("cmc") or 0) <= cmc - 2]
+        if len(cheaper) >= 2:
+            ev.append((f"Costs {int(cmc)} mana; {len(cheaper)} other cards do {sub} for {int(cmc) - 2} or less "
+                       f"(e.g. {', '.join(sorted(cheaper)[:2])})", 0.6))
+            break
+    text = cardroles.normalise_text(info.get("oracle_text"), name)
+    creatures = sum(1 for n, (i2, _) in graph.cards.items() if "Creature" in (i2.get("type_line") or ""))
+    if "Board Wipe" in roles and re.search(r"destroy all|destroy each|exile all|all creatures get -|damage to each creature",
+                                           text) and "your opponents control" not in text \
+            and "you don't control" not in text and "nontoken" not in text:
+        if ctx.profile and ctx.profile.get("primary") in GO_WIDE_PLANS:
+            ev.append((f"Wipes your own board too, but the plan is {plan} ({creatures} creatures)", 0.7))
+        elif creatures >= 25:
+            ev.append((f"Wipes your own board too, and the deck runs {creatures} creatures", 0.6))
+    if st.graph.engines() and understood and not core and not engines and strong == 0 and n_links <= 2 \
+            and not cmd_links and s["comp"]["strategy"] < 0.25:
+        ev.append(("Its theme doesn't connect to any of the deck's engines or your commander", 0.4))
+    rank = ctx.cd.popularity.get(name)
+    if rank and rank > 20000 and n_links <= 1 and not cmd_links:
+        ev.append((f"Rarely played in Commander (EDHREC rank {rank:,}, via Scryfall) and no interactions here", 0.2))
 
-    gain = in_s["total"] - out_s["total"]
-    narrow = in_s["main_role"] in NARROW or (in_s["core"] == [] and set(in_s["roles"]) <= NARROW)
-    theme_driven = not shared and in_s["comp"]["need"] < 0.1 and (in_s["comp"]["strategy"] > in_s["comp"]["need"])
-    if narrow:
-        confidence = "Situational"
-    elif theme_driven and not ctx.user_tags:
-        confidence = "Depends on your intended strategy"
-    elif gain >= 0.22 and (shared or in_s["comp"]["need"] > 0.2):
-        confidence = "Strong suggestion"
+    # ---- protection: what makes it important in THIS deck
+    if "core" in flags:
+        prot.append(("You marked this as a core card for this deck", 2.5))
+    if "not_important" in flags:
+        prot.append(("(you marked it as not important)", -0.6))
+    if info.get("game_changer"):
+        prot.append(("Official Game Changer - among the most powerful cards in Commander", 2.0))
+    if rank and rank <= 250:
+        prot.append((f"One of the most played Commander cards (EDHREC rank {rank}, via Scryfall)", 0.5))
+    if cmd_links:
+        prot.append((f"{cmd_strength.title()} synergy with your commander: {cmd_links[0][1]}",
+                     1.2 if cmd_strength == "strong" else 0.5))
+    if engines:
+        cmd_engines = [e for e in engines if st.graph.engines()[e]["with_commander"]]
+        payoff = [e for e in engines if name in st.graph.engines()[e]["payoffs"]]
+        prot.append((f"Part of the {', '.join(engines[:2]).lower()}" + (" (a payoff)" if payoff else ""),
+                     min(1.5, 0.6 * len(engines) + (0.6 if payoff and cmd_engines else 0))))
+    if n_links:
+        ex = ", ".join(o for o, _ in links[:3])
+        prot.append((f"Interacts with {n_links} other card{'s' if n_links != 1 else ''} ({strong} strong; e.g. {ex})",
+                     min(1.0, 0.08 * strong + 0.03 * moderate)))
+    if s["comp"]["strategy"] >= 0.5:
+        prot.append((f"Supports the {'/'.join(t for t in s['themes'] if t in ctx.themes)[:40]} strategy", 0.8))
+    elif s["comp"]["strategy"] >= 0.25:
+        prot.append(("Supports a secondary strategy", 0.4))
+    engine_jobs = sorted({f for subs in funcs.values() for f in subs} & synergy.ENGINE_SUBTYPES)
+    if engine_jobs and synergy.is_engine(info, roles):  # a value engine - not just a mana rock
+        prot.append((f"Repeatable engine ({', '.join(engine_jobs[:2])})", 0.6))
+    uniq = []
+    for (role, sub) in synergy.flat_functions(info, roles):
+        if role == "Land" or (roles.get(role) and roles[role].confidence < 0.5):
+            continue
+        surplus = role in GUIDELINES and ctx.guideline(role) and counts[role] > ctx.guideline(role)[1]
+        if func_counts[(role, sub)] <= 1 and not surplus and (
+                role in GUIDELINES or role in ("Graveyard Hate", "Sacrifice Outlet", "Token Doubler", "Trigger Doubler")
+                or sub in synergy.ENGINE_SUBTYPES):
+            uniq.append(sub)
+    if uniq:
+        prot.append((f"Only card in the deck doing: {', '.join(uniq[:3])}", min(1.5, 1.0 + 0.25 * (len(uniq) - 1))))
+    for role in core:
+        g = ctx.guideline(role)
+        if g and counts[role] <= g[0]:
+            prot.append((f"One of only {counts[role]} {role.lower()} cards (target for this deck {g[0]}-{g[1]})", 0.8))
+            break
+    if len(core) >= 2:
+        prot.append((f"Does several jobs: {', '.join(core)}", min(0.6, 0.3 * (len(core) - 1))))
+    if one_sided and ctx.profile and ctx.profile.get("primary") in GO_WIDE_PLANS:
+        prot.append(("One-sided wipe: clears the way without hitting your own wide board", 0.8))
+    if "Finisher" in roles and roles["Finisher"].confidence >= 0.6:
+        prot.append((f"Can win games ({', '.join(funcs.get('Finisher', ['finisher'])[:2])})", 0.7))
+    if not base["understood"]:
+        prot.append(("The analyser can't tell what this card does in this deck - it may be there for a reason "
+                     "it can't see, so it won't suggest cutting it", 1.5))
+    rewards = graph.res.get(name, (set(), set(), set()))[1]
+    payoff_for = [r for r in rewards if sum(1 for n, x in graph.res.items() if r in x[0] and n != name) >= 3]
+    if payoff_for:
+        prot.append((f"Payoff for {payoff_for[0]} the deck produces", 0.6))
+
+    E = sum(w for _, w in ev)
+    P = max(0.0, sum(w for _, w in prot))
+    eligible = E >= MIN_EVIDENCE and E - P >= MIN_MARGIN
+    cut_conf = max(0.0, min(1.0, (E - P) / 1.5)) if eligible else 0.0
+    if eligible:
+        status, verdict = "possible cut", "POSSIBLE CUT"
+    elif not ev:
+        status = "no reason to cut found"
     else:
-        confidence = "Worth considering"
-    return why_out, why_in, confidence
+        status = "protected - more reasons to keep it than to cut it"
+    if not eligible:
+        if "core" in flags:
+            verdict = "KEEP - you marked it core"
+        elif engines and P >= 3:
+            verdict = "KEEP - core engine piece"
+        elif P >= 2:
+            verdict = "KEEP - important to this deck"
+        elif not base["understood"]:
+            verdict = "KEEP - not understood (protected)"
+        elif ev:
+            verdict = "KEEP - reasons to cut don't outweigh its value"
+        else:
+            verdict = "KEEP - no reason to cut"
+    return dict(base, status=status, verdict=verdict, evidence=ev, protection=prot, E=round(E, 2), P=round(P, 2),
+                cut_confidence=round(cut_conf, 3), eligible=eligible)
 
 
-def analyse(udb, store, deck_id, settings, progress=None, providers=()):
-    """Run a full analysis. settings: mode ('collection'|'all'), goal, tags (list|None),
-    budget_usd (None = unlimited). Returns a JSON-able dict."""
-    t0 = time.time()
+class _State:
+    pass
+
+
+def prepare(udb, store, deck_id, settings, progress=None):
+    """Everything the analysis needs to understand the deck (no replacement search)."""
     say = progress or (lambda p, t: None)
-    say(0.02, "Loading card data...")
     cd = card_data(udb, progress)
     say(0.5, "Reading the deck...")
     rows = store.deck_cards(deck_id)
-    deck_rows = [r for r in rows if r["role"] in ("commander", "partner", "main")]
-    commander_cards = [cd.info(r["card_name"]) for r in deck_rows if r["role"] in ("commander", "partner")]
-    commander_cards = [c for c in commander_cards if c]
+    return prepare_rows(cd, [r for r in rows if r["role"] in ("commander", "partner", "main")], settings,
+                        udb.card_flags(deck_id), ownership_map(udb, deck_id), progress)
+
+
+def prepare_rows(cd, deck_rows, settings, flags=None, ownership=None, progress=None, review=True, tribe=None):
+    """prepare() for any list of deck rows (dict(card_name, role, quantity, type_line,
+    color_identity)) - also a deck that exists only in memory, e.g. one being built.
+    review=False skips the per-card cut review (faster); tribe overrides the detected tribe."""
+    say = progress or (lambda p, t: None)
+    st = _State()
+    st.cd = cd
+    st.deck_rows = deck_rows
+    st.flags = flags or {}
+    commander_cards = [c for c in (cd.info(r["card_name"]) for r in deck_rows if r["role"] in ("commander", "partner"))
+                       if c]
     deck_infos = [cd.info(r["card_name"]) for r in deck_rows if r["role"] == "main"]
-    detected = strategy.detect(commander_cards, [c for c in deck_infos if c])
-    ownership = ownership_map(udb, deck_id)
-    ctx = Context(cd, deck_rows, settings, ownership, detected)
-    comp = composition(ctx)
-    weak = weaknesses(ctx, comp)
+    core_infos = [cd.info(n) for n, f in st.flags.items() if "core" in f and cd.info(n)]
+    st.detected = detected = strategy.detect(commander_cards, [c for c in deck_infos if c], core_infos)
+    if tribe:
+        detected["tribe"] = tribe
+    st.ownership = ownership if ownership is not None else {}
+    st.ctx = ctx = Context(cd, deck_rows, settings, st.ownership, detected)
+    st.uncertain, st.uncertain_why = strategy_certainty(detected, ctx.user_tags)
+    say(0.56, "Understanding the commander and mapping how the cards work together...")
+    st.graph_cards = graph_cards = {}
+    for r in deck_rows:
+        info = cd.info(r["card_name"])
+        if info and "Land" not in (info.get("type_line") or "").split(" // ")[0]:
+            graph_cards[r["card_name"]] = (info, cd.roles.get(info["name"], {}))
+    st.graph = graph = synergy.InteractionGraph(graph_cards, [c["card_name"] for c in ctx.commanders], ctx.tribe)
+    st.profile = prof = commander.profile(commander_cards, graph, detected.get("tribe"))
+    ctx.profile = prof
+    st.comp = comp = composition(ctx)
+    st.targets = deck_targets(ctx, comp, prof, graph)
+    ctx.targets = {r: tuple(v["target"]) for r, v in st.targets.items()}
+    comp["core"] = {r: ctx.counts.get(r, 0) for r in GUIDELINES if ctx.guideline(r)}
+    st.func_counts = _func_counts(ctx, graph_cards)
+    st.counts = Counter(ctx.counts)
+    say(0.64, "Checking every card before suggesting any cut...")
+    st.review = []
+    for r in ctx.cards if review else []:
+        if r["role"] != "main" or r["card_name"] not in graph_cards:
+            continue  # commanders and lands are never cuts
+        info, roles = graph_cards[r["card_name"]]
+        st.review.append(review_card(ctx, st, r["card_name"], info, roles))
+    st.review.sort(key=lambda v: (-v["cut_confidence"], v["P"] - v["E"]))
+    st.confidence = analysis_confidence(prof, st.review, st.uncertain, st.uncertain_why)
+    return st
+
+
+def weakest_cards(st, n=8):
+    """'What would you cut?' - the most plausible cut candidates, each with reasons to cut AND
+    to keep. Nothing is removed; pinned and core cards are left out."""
+    rows = [v for v in st.review if v["status"] != "pinned" and "core" not in v["flags"]]
+    with_reasons = sorted([v for v in rows if v["E"] > 0], key=lambda v: (-(v["E"] - v["P"]), v["P"]))
+    ctx = st.ctx
+
+    def needed_job(v):  # ramp / draw / removal... while that job is not over target: never "weakest" padding
+        return any(r in GUIDELINES and st.counts[r] <= (ctx.guideline(r) or (0, 99))[1] for r in v["roles"])
+    rest = sorted([v for v in rows if v["E"] <= 0 and v["understood"] and not needed_job(v)
+                   and not any(t.startswith("Only card in the deck") for t, _ in v["protection"])],
+                  key=lambda v: v["P"])
+    out = []
+    for v in (with_reasons + rest)[:n]:
+        expend = max(0.05, min(0.95, 0.5 + (v["E"] - v["P"]) / 4))
+        out.append(dict(name=v["name"], expendability=round(expend, 2), cut_confidence=v["cut_confidence"],
+                        reasons_to_cut=[t for t, _ in sorted(v["evidence"], key=lambda e: -e[1])],
+                        reasons_to_keep=[t for t, w in sorted(v["protection"], key=lambda e: -e[1]) if w > 0],
+                        links=v["links"], strong=v["strong"], roles=v["roles"], functions=v["functions"],
+                        engines=v["engines"], P=v["P"], E=v["E"], verdict=v["verdict"]))
+    return out
+
+
+def slot_weakest(cf, st, n=10):
+    """'If you need to free slots, inspect these first' - from the cut engine (cutfinder):
+    the cards whose removal costs the deck least, with what each contributes and what
+    you'd lose. Never 'bad cards'; protected / essential / shortage-making cards are left out."""
+    rev = {v["name"]: v for v in st.review}
+    out = []
+    for cost, name, fl in cf.weakest_slots(n):
+        v = rev.get(name, {})
+        out.append(dict(name=name, flexibility=fl["level"], expendability=round(max(0.05, min(0.95, 0.6 - cost)), 2),
+                        cut_confidence=v.get("cut_confidence", 0), reasons_to_cut=fl["why"],
+                        reasons_to_keep=fl["keep"], losses=fl["losses"], links=v.get("links", 0),
+                        strong=v.get("strong", 0), roles=v.get("roles", []), functions=v.get("functions", []),
+                        engines=v.get("engines", []), P=v.get("P", 0), E=v.get("E", 0), verdict=v.get("verdict")))
+    return out
+
+
+def find_a_cut(udb, store, deck_id, settings, in_name, st=None, limit=5):
+    """'I want to add THIS card - what should come out?' Ranked OUT options (deck before vs
+    after each swap) with gains, losses and the net effect - or 'No safe cut found' with why."""
+    import cutfinder
+    cf, st = cutfinder.finder_for(udb, store, deck_id, settings, st)
+    return cf.find(in_name, limit=limit)
+
+
+def find_cuts_for(udb, store, deck_id, settings, in_name, st=None, limit=3):
+    """Kept for callers of the old name: the same as find_a_cut."""
+    return find_a_cut(udb, store, deck_id, settings, in_name, st, limit)
+
+
+def analyse(udb, store, deck_id, settings, progress=None, providers=(), quick=False):
+    """Run a full analysis. settings: mode ('collection'|'all'), goal, tags (list|None),
+    budget_usd (None = unlimited). quick=True skips the replacement search (tests).
+    Returns a JSON-able dict."""
+    t0 = time.time()
+    say = progress or (lambda p, t: None)
+    say(0.02, "Loading card data...")
+    st = prepare(udb, store, deck_id, settings, progress)
+    ctx, cd, graph, comp, counts = st.ctx, st.cd, st.graph, st.comp, st.counts
+    deck_rows, ownership, review = st.deck_rows, st.ownership, st.review
+    weak = weaknesses(ctx, comp, st.targets)
     mode = settings.get("mode", "collection")
     budget = 0.0 if mode == "collection" else settings.get("budget_usd")
+    uncertain = st.uncertain
+    cuts = [v for v in review if v["eligible"]]
+    if os.environ.get("CARDSCAN_DEBUG_ANALYSER"):
+        print(describe_review(review))
 
-    say(0.6, "Looking for possible cuts...")
-    counts = Counter(ctx.counts)
-    cut_scores = []
-    for r in ctx.cards:
-        if r["role"] != "main":
-            continue
-        front = (r.get("type_line") or "").split(" // ")[0]
-        if "Land" in front:  # lands are never suggested as cuts in this version
-            continue
-        s = score(ctx, r["card_name"], counts, in_deck=True)
-        if ctx.goal != "casual" and is_staple(ctx, s):
-            continue  # don't suggest cutting widely-played power cards when improving a deck
-        cut_scores.append(s)
-    cut_scores.sort(key=lambda s: s["total"])
-
-    say(0.7, "Searching for replacements...")
     deck_names = {r["card_name"] for r in deck_rows}
-    pool = candidate_pool(ctx, deck_names, mode)
-    scored = [score(ctx, n, counts) for n in pool]
-    scored.sort(key=lambda s: -s["total"])
-    if ctx.goal == "casual":  # keep casual decks on-theme: no generic staple pushes
-        scored = [s for s in scored if s["comp"]["commander"] + s["comp"]["strategy"] >= 0.3 or s["comp"]["need"] >= 0.3]
-    scored = scored[:600]
-
-    say(0.85, "Building the package...")
-    size = PACKAGE_SIZE[ctx.goal]
-    used, swaps, spent = set(), [], 0.0
-    for out_s in cut_scores[:max(size * 3, 12)]:
-        if len(swaps) >= size:
-            break
-        before = Counter(counts)
-        best, best_val = None, None
-        for cand in scored:
-            if cand["name"] in used:
-                continue
-            fresh = score(ctx, cand["name"], counts)
-            gain = fresh["total"] - out_s["total"]
-            if gain < MIN_GAIN[ctx.goal]:
-                continue
-            shared_roles = set(fresh["core"]) & set(out_s["core"])
-            shared = bool(shared_roles)
-            fills = fresh["comp"]["need"] > 0.2
-            if out_s["core"] and not shared and not fills and any(ctx.need(r, counts) > 0.2 for r in out_s["core"]):
-                continue  # don't cut a needed job for something unrelated
-            lost = [r for r in out_s["core"] if r not in shared_roles and ctx.guideline(r)
-                    and counts[r] - 1 < ctx.guideline(r)[0] and out_s["roles"][r].confidence >= 0.6]
-            if lost:
-                continue  # would leave the deck short of a job it needs (e.g. its only counterspell)
-            own = ownership_of(ctx, cand["name"])
-            cost = own["cost"]
-            if budget is not None:
-                if cost is None or spent + cost > budget + 1e-9:
-                    continue
-            val = gain + (0.05 if shared else 0) + (0.03 if own["status"] == "available" else 0)
-            if best_val is None or val > best_val:
-                best, best_val = (fresh, own), val
-        if best is None:
-            continue
-        in_s, own = best
-        used.add(in_s["name"])
-        spent += own["cost"] or 0.0
-        for r in out_s["roles"]:
-            counts[r] -= 1
-        for r in in_s["roles"]:
-            counts[r] += 1
-        why_out, why_in, confidence = explain(ctx, out_s, in_s, before)
-        swaps.append(dict(out=out_s["name"], into=in_s["name"], ownership=own, why_out=why_out, why_in=why_in,
-                          confidence=confidence, gain=round(in_s["total"] - out_s["total"], 3),
-                          out_components={k: round(v, 2) for k, v in out_s["comp"].items()},
-                          in_components={k: round(v, 2) for k, v in in_s["comp"].items()},
-                          in_roles=sorted(in_s["roles"]), out_roles=sorted(out_s["roles"]),
-                          in_cmc=in_s["cmc"], out_cmc=out_s["cmc"]))
+    pool, swaps, considered, rec_info, slot_alternatives, used_elsewhere = [], [], [], {}, [], []
+    spent, counts_after = 0.0, Counter(counts)
+    weakest = weakest_cards(st)
+    if not quick:
+        # 1. cards worth ADDING: need-driven, tiered, grouped - no fixed count (recommend.py)
+        say(0.72, "Working out what the deck needs and which cards solve it...")
+        import community
+        import cutfinder
+        import recommend
+        feedback = udb.suggestion_feedback(deck_id)
+        comm = community.load(recommend.commander_key(st))
+        recs = recommend.recommend(st, settings, feedback, comm, debug=bool(os.environ.get("CARDSCAN_DEBUG_ANALYSER")))
+        pool = recs["items"]
+        # 2. the upgrade plan: for each idea, "what is the least painful card to remove for it?" -
+        #    judged on the deck before vs after, applied one swap at a time (cutfinder.py)
+        say(0.82, "Finding the least painful cut for each idea and building a compatible plan...")
+        cf = cutfinder.CutFinder(st, settings, feedback, comm, rec=recs["recommender"])
+        # every idea that passed the need test (recommend.py already searched ALL free cards you own in
+        # My Collection mode); strategy-dependent (NICHE) ideas stay on Consider
+        tiers = {it["name"]: it["tier"] for it in recs["items"]}
+        names = [it["name"] for it in recs["items"] if it["tier"] != "NICHE"]
+        cands = [(n, tiers.get(n), ownership_of(ctx, n)) for n in names
+                 if not (feedback.get(n) == "not_for_deck")]
+        plan, slot_alternatives = cf.plan(cands, budget=budget)
+        graph_now = st.graph
+        for w in plan:
+            d, e = w["d"], w["e"]
+            fi, fo = cf.facts(d["into"]), cf.facts(d["out"])
+            v = next((x for x in review if x["name"] == d["out"]), {})
+            own = w["ownership"]
+            if own.get("status") != "available":
+                spent += own.get("cost") or 0.0
+            for r in fo["roles"]:
+                counts_after[r] -= 1
+            for r in fi["roles"]:
+                counts_after[r] += 1
+            links_in = d["links_in"]
+            swaps.append(dict(
+                out=d["out"], into=d["into"], ownership=own, tier=w["tier"], tier_label=cutfinder.TIER_LABEL[w["tier"]],
+                confidence=cutfinder.TIER_LABEL[w["tier"]], kind=d["kind"], consider_tier=w["consider_tier"],
+                net=e["net"], net_value=round(w["adj"], 3), gains=e["gains"], losses=e["losses"],
+                why_out=e["why_out"], why_in=e["why_in"], out_kept=e["keep"],
+                cut_confidence=cutfinder._conf(w["adj"]), replacement_confidence=cutfinder._conf(w["adj"]),
+                swap_confidence=cutfinder._conf(w["adj"]), parts=d["parts"],
+                other_outs=w["other_outs"], other_ins=w["other_ins"],
+                in_links=[dict(card=n, why=t, strength=x) for n, t, x in links_in[:20]], in_links_total=len(links_in),
+                out_links=[dict(card=n, why=t, strength=x) for n, t, x in graph_now.detailed(d["out"])[:20]],
+                in_roles=sorted(fi["roles"]), out_roles=sorted(fo["roles"]), in_cmc=fi["cmc"], out_cmc=fo["cmc"],
+                in_functions=sorted({x for _, x in fi["funcs"]})[:4], out_functions=v.get("functions", []),
+                gain=round(w["adj"], 3)))
+            if v:
+                v["status"] = "suggested cut"
+        used = {s["into"] for s in swaps}
+        considered = [it for it in recs["items"] if it["name"] not in used]
+        rec_info = dict(groups=[dict(g, names=[n for n in g["names"] if n not in used]) for g in recs["groups"]],
+                        needs=recs["needs"], mode=recs["mode"],
+                        shown=sum(1 for it in considered if it["tier"] in ("EXCELLENT", "STRONG", "WORTH")),
+                        rejected=recs["rejected"],
+                        no_collection_upgrades=mode == "collection" and not any(
+                            it["tier"] in ("EXCELLENT", "STRONG", "WORTH") for it in considered))
+        rec_info["groups"] = [g for g in rec_info["groups"] if g["names"]]
+        # 3. owned, but in another deck: shown separately, never part of the free plan
+        if mode == "collection":
+            busy = [n for n, o in ownership.items() if o["free"] == 0 and n not in deck_names]
+            scored_busy = []
+            for n in busy:
+                info = cd.info(n)
+                why_not = cf.rec.availability(info["name"], info) if info else "unknown card"
+                if why_not and "used in another deck" not in why_not:
+                    continue  # off-colour, not legal, a land...
+                f = cf.facts(info["name"])
+                scored_busy.append((f["quality"] + 0.3 * f["cmd_fit"], info["name"]))
+            for _, n in sorted(scored_busy, reverse=True)[:20]:
+                opts, _ = cf.options(n, limit=1)
+                if opts and opts[0]["tier"] in ("HIGH", "GOOD"):
+                    used_elsewhere.append(dict(name=n, used_in=ownership[n]["used_in"], out=opts[0]["out"],
+                                               tier_label=cutfinder.TIER_LABEL[opts[0]["tier"]],
+                                               net=cf.explain(opts[0])["net"]))
+                if len(used_elsewhere) >= 5:
+                    break
+        weakest = slot_weakest(cf, st)
 
     improvements = []
     for role in GUIDELINES:
-        d = counts[role] - ctx.counts[role]
-        if d > 0 and ctx.guideline(role):
-            improvements.append(f"+{d} {role.lower()}")
+        d = counts_after[role] - ctx.counts[role]
+        if d and ctx.guideline(role):
+            improvements.append(f"{d:+d} {role.lower()}")
     mv_change = sum(s["in_cmc"] - s["out_cmc"] for s in swaps) / max(1, comp["spells"])
-    if swaps and mv_change < -0.02:
+    if swaps and abs(mv_change) >= 0.02:
         improvements.append(f"average mana value {comp['avg_mv']:.2f} -> {comp['avg_mv'] + mv_change:.2f}")
-    if sum(s["in_components"]["commander"] - s["out_components"]["commander"] for s in swaps) > 0.5:
-        improvements.append("better commander synergy")
-
-    # owned cards that would help but are in other decks: shown as alternatives, never as free
-    alternatives = []
-    if mode == "collection":
-        busy = [n for n, o in ownership.items() if o["free"] == 0 and n not in deck_names]
-        alt_pool = candidate_pool(ctx, deck_names, "all")
-        alt = [score(ctx, n, counts) for n in alt_pool if n in set(busy)]
-        alt.sort(key=lambda s: -s["total"])
-        for s in alt[:3]:
-            alternatives.append(dict(name=s["name"], used_in=ownership[s["name"]]["used_in"],
-                                     roles=sorted(s["core"] or s["roles"])[:3]))
+    alternatives = [dict(name=u["name"], used_in=u["used_in"], out=u["out"]) for u in used_elsewhere]
 
     combos = []
     for p in providers:  # optional extras (off unless asked for); never affect the swaps above
@@ -565,17 +929,49 @@ def analyse(udb, store, deck_id, settings, progress=None, providers=()):
             combos.append(dict(error=f"{getattr(p, 'name', 'provider')}: {e}"))
     annotate_combos(udb, deck_id, [c for c in combos if "error" not in c])
 
+    detected = st.detected
     say(1.0, "Done")
+    prof = st.profile
     return dict(
         version=ANALYSER_VERSION, deck_id=deck_id, created=time.strftime("%Y-%m-%d %H:%M"),
         seconds=round(time.time() - t0, 2), settings=settings,
         commanders=[c["card_name"] for c in ctx.commanders], identity=ctx.identity,
         detected=dict(primary=detected["primary"], secondary=detected["secondary"], tribe=detected.get("tribe"),
-                      reasons={k: v[:3] for k, v in detected["reasons"].items()}),
+                      reasons={k: v[:3] for k, v in detected["reasons"].items()},
+                      scores={k: round(v, 1) for k, v in sorted(detected["scores"].items(), key=lambda kv: -kv[1])[:6]}),
         active_themes=list(ctx.themes), user_tags=ctx.user_tags,
-        composition=comp, weaknesses=weak, swaps=swaps, cost=round(spent, 2), budget=budget,
+        strategy_uncertain=uncertain, strategy_note=st.uncertain_why,
+        commander_profile=dict(mechanics=prof["mechanics"], primary=prof["primary_name"],
+                               supporting=prof["supporting_names"], chain=prof["chain"], needs=prof["needs"],
+                               understanding=prof["understanding"]),
+        engines={e: dict(size=len(v["members"]), payoffs=v["payoffs"][:6], with_commander=v["with_commander"])
+                 for e, v in sorted(graph.engines().items(), key=lambda kv: -len(kv[1]["members"]))},
+        targets=st.targets, confidence=st.confidence,
+        composition=comp, weaknesses=weak, swaps=swaps, considered=considered, recommendations=rec_info,
+        weakest=weakest, slot_alternatives=slot_alternatives, used_elsewhere=used_elsewhere,
+        cost=round(spent, 2), budget=budget,
         improvements=improvements, alternatives=alternatives, candidates_considered=len(pool), combos=combos,
-        cuts_considered=[dict(name=s["name"], score=round(s["total"], 3)) for s in cut_scores[:15]])
+        protected=sorted(n for n, f in st.flags.items() if "never_cut" in f and n in deck_names),
+        flags={n: sorted(f) for n, f in st.flags.items() if n in deck_names},
+        cut_review=[dict(name=v["name"], status=v["status"], verdict=v["verdict"], cut_confidence=v["cut_confidence"],
+                         E=v["E"], P=v["P"], evidence=[[t, round(w, 2)] for t, w in v["evidence"]],
+                         protection=[[t, round(w, 2)] for t, w in v["protection"]], links=v["links"],
+                         strong=v["strong"], moderate=v["moderate"], commander_synergy=v["commander_synergy"],
+                         engines=v["engines"], roles=v["roles"], functions=v.get("functions", []),
+                         flags=v["flags"], understood=v["understood"]) for v in review])
+
+
+def describe_review(review):
+    """Debug text: why each card was / wasn't a cut candidate."""
+    lines = []
+    for v in review:
+        lines.append(f"Card: {v['name']}  ->  {v.get('verdict', v['status'])} (evidence {v['E']}, protection {v['P']}, "
+                     f"cut confidence {v['cut_confidence']:.0%})")
+        for t, w in v["evidence"]:
+            lines.append(f"   cut evidence +{w}: {t}")
+        for t, w in v["protection"]:
+            lines.append(f"   protection  +{w}: {t}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- applying / undoing

@@ -6,4 +6,5 @@ rapidocr
 onnxruntime
 onnx
 Pillow
+python-docx
 # training the card model only (train_model.py): torch, torchvision (CUDA build)

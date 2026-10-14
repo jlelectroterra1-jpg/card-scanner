@@ -48,8 +48,9 @@ class SessionTarget:
 
 
 class DeckScanTarget:
-    """Scanning a physical deck into one deck. Duplicates of non-basic cards are flagged
-    (never silently dropped); the scanned commander card isn't counted twice."""
+    """Scanning a physical deck into one deck. A copy Commander doesn't allow (a second
+    non-basic card) is ignored - not added - and reported; the scanned commander card
+    isn't counted twice."""
     kind = "deck"
 
     def __init__(self, path, deck_id, deck_name, store=None, data=None):
@@ -95,21 +96,22 @@ class DeckScanTarget:
         return {c["name"].lower() for c in self.base["commanders"]}
 
     def add(self, app, entry, card):
-        """Returns a duplicate warning dict(name, count) or None."""
+        """Add a scanned card. A copy beyond what Commander allows (a second Sol Ring; basics,
+        "any number" cards and Seven Dwarves-style limits excepted) is NOT added: returns
+        dict(rejected=True, name, count, limit) so the scanner can say so. Else None."""
         name = card.get("name", "")
         # The physical commander card is part of the pile: it fills the commander slot.
         cmd_unscanned = [c for c in self.base["commanders"] if c["name"].lower() == name.lower() and not c["physical"]]
         if cmd_unscanned and not any(e.get("commander_card") and e.get("name") == name for e in self.entries):
             entry["commander_card"] = True
         entry["name"] = name
+        if not entry.get("commander_card"):
+            limit = deckrules.copy_limit(name, card.get("type_line"), card.get("oracle_text"))
+            have = self.copies_of(name)
+            if limit is not None and have >= limit:
+                return dict(rejected=True, name=name, count=have, limit=limit)  # duplicate ignored
         self.entries.append(entry)
         self.save()
-        if entry.get("commander_card"):
-            return None
-        limit = deckrules.copy_limit(name, card.get("type_line"))
-        have = self.copies_of(name)
-        if limit is not None and have > limit:
-            return dict(name=name, count=have, limit=limit)
         return None
 
     def copies_of(self, name):

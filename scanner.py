@@ -10,6 +10,7 @@ import csv
 import json
 import os
 import queue
+import sys
 import threading
 import time
 import unicodedata
@@ -45,7 +46,16 @@ MIN_ZONE_H = 200  # scan box smaller than this (camera pixels) = card too small 
 
 # Scan trigger tuning (on a 96-px-wide grey thumbnail of the scan zone).
 PRESENT_FRAC = 0.20   # this share of the zone must differ from the empty desk
-CHANGE_FRAC = 0.20    # ...or from the last scanned card, to count as "something new"
+# ONE PHYSICAL PRESENTATION = ONE SCAN. After a card is processed (added, rejected as a deck
+# duplicate, sent to review, or failed) the scanner is LOCKED on it. It only unlocks when the
+# box shows the empty background again (card removed) or, once things are still, the picture
+# model's fingerprint of the box is clearly a different card (next card dropped on top).
+# Hands, glare, lighting and small shifts never unlock it. Calibrated on real scans: the same
+# card (incl. 21 real accidental re-scans, shifts, light, glare, blur) <= 0.31; different
+# cards stacked on top >= 0.455.
+NEW_CARD_DIST = 0.40  # fingerprint distance (1 - cosine) above which it's a different card
+NEW_CARD_THUMB = 1.9  # same, for the colour-thumbnail fallback when the picture model is missing
+EMPTY_FRAMES = 2      # frames of empty background needed to count the card as removed
 STILL_LEVEL = 4.0     # mean pixel change between frames below this = not moving
 STILL_FRAMES = 4      # ~0.13 s at 30 fps
 
@@ -79,9 +89,13 @@ def save_debug(zone_img, card_img, res):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         cv2.imwrite(os.path.join(DEBUG_DIR, f"{stamp}_zone.jpg"), zone_img)
         cv2.imwrite(os.path.join(DEBUG_DIR, f"{stamp}_card.jpg"), res.get("card", card_img))
+        top = (res.get("printings") or [{}])[0]
         info = dict(name_text=res.get("name_text"), how=res.get("how"), confident=res.get("confident"),
                     candidates=res.get("candidates", [])[:5], secs=round(res.get("secs", 0), 2),
-                    added=(res.get("printings") or [{}])[0].get("name") if res.get("confident") else None)
+                    added=top.get("name") if res.get("confident") else None,
+                    card_confidence=res.get("card_confidence"),
+                    printing=dict(res.get("printing") or {}, selected=f"{top.get('set_code', '')} #{top.get('collector_number', '')}")
+                    if res.get("printing") else None)
         with open(os.path.join(DEBUG_DIR, f"{stamp}.json"), "w", encoding="utf-8") as f:
             json.dump(info, f, indent=1)
         files = sorted(os.listdir(DEBUG_DIR))
@@ -92,10 +106,18 @@ def save_debug(zone_img, card_img, res):
 
 
 def beep(ok=True):
+    """ok=True: one high beep (added). False: two low beeps (not sure / failed).
+    "dup": one short mid beep (duplicate ignored in Scan Deck mode). Silent under the test
+    runner (or with CARDSCAN_MUTE=1) - the app itself never imports unittest."""
+    if os.environ.get("CARDSCAN_MUTE") or "unittest" in sys.modules:
+        return
+
     def run():
         try:
             import winsound
-            if ok:
+            if ok == "dup":
+                winsound.Beep(900, 60)
+            elif ok:
                 winsound.Beep(1400, 80)
             else:
                 winsound.Beep(600, 120)
@@ -142,8 +164,12 @@ class Scanner:
         self.drag = None
         self.prev_small = None
         self.still = 0
-        self.armed = True
-        self.last_scanned_small = None
+        # Physical-presentation lock (see NEW_CARD_DIST): locked on the card last processed.
+        self.locked, self.lock_fp, self.lock_kind = False, None, None
+        self.lock_checked, self.empty_frames = True, 0
+        # Automatic scanning always starts OFF (never saved): nothing is scanned while you
+        # set up the camera. Start Scan / P turns it on; SPACE still scans one card any time.
+        self.auto_scan = False
         self.busy = False
         self.review = None  # recognition result waiting for the user to choose
         self.typing = None  # {"kind": "search" | "lock", "text", "matches", "sel"} while typing in the window
@@ -220,6 +246,23 @@ class Scanner:
             root.withdraw()
             root.attributes("-topmost", True)
             path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+            root.destroy()
+            return path or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def ask_save_file(title, initial_path, filetypes):
+        """Windows' own Save As dialog (it asks before replacing a file)."""
+        try:
+            import tkinter
+            from tkinter import filedialog
+            root = tkinter.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            path = filedialog.asksaveasfilename(title=title, initialdir=os.path.dirname(initial_path),
+                                                initialfile=os.path.basename(initial_path), filetypes=filetypes,
+                                                defaultextension=".docx")
             root.destroy()
             return path or None
         except Exception:  # noqa: BLE001
@@ -307,6 +350,9 @@ class Scanner:
             self.collection_screen.refresh()
         beep(True)
         msg = f"{n} card{'s' if n != 1 else ''} added to {name}"
+        unsure = sum(1 for e in pending if e.get("printing_uncertain"))
+        if unsure:
+            msg += f" ({unsure} with printing unconfirmed - noted on the card)"
         self.set_status(msg, GREEN)
 
         def done(clear, _t):
@@ -366,7 +412,6 @@ class Scanner:
         self.target = DeckScanTarget(DECK_SCAN_PATH, deck_id, deck["name"], self.deck_store, data=data)
         self.target.save()
         self._pending = None
-        self.armed, self.last_scanned_small = True, None
         self.switch_tab("scanner")
         self.set_status(f"Scanning into {deck['name']} - feed the cards through the box", YELLOW)
 
@@ -457,7 +502,6 @@ class Scanner:
         if self.target.kind == "deck":
             self.pause_deck_scan()
         self.target = CommanderPickTarget(deck_id, deck["name"], partner)
-        self.armed, self.last_scanned_small = True, None
         self.switch_tab("scanner")
         self.set_status(f"Put the {'partner' if partner else 'commander'} for {deck['name']} in the box", YELLOW)
 
@@ -478,25 +522,14 @@ class Scanner:
         self.open_dialog(Dialog(f"Set {card['name']} as {role}?", f"For {t.deck_name}",
                                 buttons=[("No", False, "normal"), ("Yes", True, "primary")], on_done=done))
 
-    def ask_duplicate(self, dup, entry):
-        """A second copy of a card Commander allows once: never dropped silently."""
-        from ui import Dialog
-
-        def done(v, _t):
-            if v in ("remove", "undo") and entry in self.target.entries:
-                self.target.entries.remove(entry)
-                self.target.save()
-                if v == "undo":  # maybe it was misread: look at the card in the box again
-                    self.armed, self.last_scanned_small = True, None
-                self.set_status(f"Removed the extra {dup['name']}", GREY)
-            else:
-                self.set_status(f"Kept {dup['count']} copies of {dup['name']}", YELLOW)
-        beep(False)
-        self.open_dialog(Dialog("Duplicate detected",
-                                [f"{dup['name']} is already in this deck - this would be copy {dup['count']}.",
-                                 f"Commander allows {dup['limit']}."],
-                                buttons=[("Undo last scan", "undo", "normal"), ("Remove duplicate", "remove", "danger"),
-                                         ("Keep anyway", "keep", "primary")], on_done=done))
+    def oracle_text(self, card):
+        """Rules text (for "a deck can have any number of cards named ..."), if known."""
+        try:
+            r = self.db.db.execute("SELECT oracle_text FROM oracle_cards WHERE oracle_id = ?",
+                                   (card.get("oracle_id"),)).fetchone()
+            return r[0] if r else None
+        except Exception:  # noqa: BLE001  (older cards.db without oracle_cards)
+            return None
 
     def deck_mode_view(self):
         t = self.target
@@ -642,8 +675,7 @@ class Scanner:
     def capture_background(self, frame):
         """Learn the current (empty) scan box as the background, and remember it on disk."""
         self.background = self.zone_crop(frame).copy()
-        self.armed = True
-        self.last_scanned_small = None
+        self.unlock("background learned")  # learning it means the box is empty
         self.bg_state, self.bg_verified = "ok", True
         try:
             self.save_background(frame)
@@ -715,10 +747,64 @@ class Scanner:
         elif self.last_frame is not None:
             self.capture_background(self.last_frame)
 
+    def set_auto_scan(self, on):
+        """Start / Stop Scan. Stopping only stops automatic triggering: the camera, the
+        background, the scan list, the deck session and the destination are untouched."""
+        self.auto_scan = bool(on)
+        self.still, self.prev_small = 0, None  # stillness is measured afresh after a start
+        if not on:
+            self.set_status("Scanning stopped - camera stays live. P or Start Scan to resume, SPACE scans one card",
+                            GREY)
+        elif not self.zone:
+            self.set_status("Scanning ON - drag a scan box first", YELLOW)
+        elif self.background is None:
+            self.set_status("Scanning ON - but no background yet: clear the box and press B", YELLOW)
+        else:
+            self.set_status("Scanning ON - put a card in the box", GREEN)
+
+    # ---- one physical presentation = one scan ------------------------------------------
+
+    @property
+    def armed(self):
+        """Ready for a new card (not locked on the last one)."""
+        return not self.locked
+
+    def presentation_fp(self, zone_img):
+        """Fingerprint of what's in the box: the picture model's embedding (robust to light,
+        glare, blur and small shifts), or a colour thumbnail if the model isn't there."""
+        model = getattr(self.rec, "visual", None)
+        if model is not None and hasattr(model, "embed"):
+            return ("emb", model.embed(zone_img).astype(np.float32))
+        from visual import colour_thumb
+        return ("thumb", colour_thumb(zone_img, 32, 44))
+
+    @staticmethod
+    def fp_distance(a, b):
+        if a is None or b is None or a[0] != b[0]:
+            return 9.0
+        if a[0] == "emb":
+            return 1.0 - float(a[1] @ b[1])
+        from visual import trimmed_distance
+        return trimmed_distance(a[1], b[1], 0.7)
+
+    def is_new_card(self, zone_img):
+        limit = NEW_CARD_DIST if self.lock_fp is None or self.lock_fp[0] == "emb" else NEW_CARD_THUMB
+        return self.fp_distance(self.presentation_fp(zone_img), self.lock_fp) > limit
+
+    def lock(self, zone_img, kind="pending"):
+        self.locked, self.lock_kind = True, kind
+        self.lock_fp = self.presentation_fp(zone_img)
+        self.lock_checked, self.empty_frames = True, 0
+
+    def unlock(self, why=""):
+        self.locked, self.lock_fp, self.lock_kind = False, None, None
+        self.lock_checked, self.empty_frames = True, 0
+
     def update_trigger(self, frame):
-        """Watch the zone and start a scan when a new card has settled in it."""
+        """Watch the zone; scan a card once it has settled - but each physical card only once."""
         z = self.zone_crop(frame)
         s = self.small(z)
+        moving = False
         if self.prev_small is not None and self.prev_small.shape == s.shape:
             moving = np.abs(s - self.prev_small).mean() > STILL_LEVEL
             self.still = 0 if moving else self.still + 1
@@ -729,20 +815,47 @@ class Scanner:
             present = False  # same playmat, just lighter/darker than when it was learned
         if not present and self.bg_state == "check" and looks_empty(z, self.background):
             self.bg_state = "ok"  # the saved background matches again
-        if not self.armed:
-            # Wait until the last card is taken away or covered by a new one.
-            if not present or (self.last_scanned_small is not None
-                               and self.frac_diff(s, self.last_scanned_small) > CHANGE_FRAC):
-                self.armed = True
-            return
+        if self.locked:
+            # Tracked even while scanning is stopped, so Stop -> Start never re-scans the card.
+            if not present:
+                self.empty_frames += 1
+                if self.empty_frames >= EMPTY_FRAMES:
+                    self.unlock("card removed")
+            else:
+                self.empty_frames = 0
+                if moving:
+                    self.lock_checked = False  # something moved: look again once it's still
+                elif self.still >= STILL_FRAMES and not self.lock_checked and not self.busy:
+                    self.lock_checked = True
+                    if self.is_new_card(z):
+                        self.unlock("a different card")  # e.g. the next card dropped on top
+                    elif self.auto_scan and self.review is None and self.dialog is None:
+                        self.set_status("Scanned - waiting for next card (same card still there; "
+                                        "R = it's another identical copy)", GREY)
+            if self.locked:
+                return
+        if not self.auto_scan:
+            return  # Stop Scan: no automatic scans (SPACE still works)
         if present and self.still >= STILL_FRAMES and not self.busy and self.review is None and self.dialog is None:
             self.start_scan(frame)
 
+    def rescan_copy(self):
+        """R: the card in the box really is another identical copy - scan it once more."""
+        if self.busy or not self.zone or self.last_frame is None:
+            return
+        self.unlock("another copy")
+        self.start_scan(self.last_frame, manual=True)
+        self.set_status("Scanning another copy of the same card...", YELLOW)
+
     def start_scan(self, frame, manual=False):
-        self.busy = True
-        self.armed = False
         z = self.zone_crop(frame).copy()
-        self.last_scanned_small = self.small(z)
+        if manual and self.locked and self.lock_kind in ("done", "pending") and not self.is_new_card(z):
+            # SPACE on the card that was just scanned: don't add it again.
+            self.set_status("Already scanned this card - put the next card in (R = scan another identical copy)",
+                            YELLOW)
+            return False
+        self.busy = True
+        self.lock(z)  # this physical presentation is now being processed
         bg = self.background.copy() if self.background is not None else None
         locked = self.settings.get("locked_set")
         self.set_status("Reading card...", YELLOW)
@@ -762,13 +875,14 @@ class Scanner:
                 card, why = self.rec.find_card_checked(z, bg)
                 if card is None:
                     self.results.put(dict(candidates=[], printings=[], confident=False, name_text="",
-                                          card=None, no_card=True, why=why))
+                                          card=None, no_card=True, why=why, manual=False))
                     return
             try:
                 res = self.rec.identify(card, locked)
             except Exception as e:  # never let one bad frame kill the scanner
                 res = dict(candidates=[], printings=[], confident=False, name_text=f"error: {e}", card=card)
             res["secs"] = time.time() - t
+            res["manual"] = manual
             save_debug(z, card, res)
             self.results.put(res)
 
@@ -778,12 +892,24 @@ class Scanner:
 
     def handle_result(self, res):
         self.busy = False
+        # Whatever happens next, this physical card has been processed: stay locked on it.
+        # A failed read only blocks automatic re-scans - SPACE may retry it.
+        self.lock_kind = "failed" if (res.get("no_card") or not res.get("candidates")) else "done"
+        if not res.get("manual", True) and not self.auto_scan:
+            # an automatic scan that was already running when Stop Scan was pressed
+            self.lock_kind = "failed"  # not added: SPACE can still scan it
+            self.set_status("Scanning stopped - that card was not added", GREY)
+            return
         if res.get("no_card"):
             self.set_status("Ready", WHITE)
             return
         if res["confident"] and res["printings"]:
-            self.add_card(res["printings"], res["card"], res.get("how"))
-            beep(True)
+            if os.environ.get("CARDSCAN_DEBUG_PRINTING") or self.settings.get("debug_printing"):
+                from printing import describe
+                print(describe(res["printings"][0]["name"], res.get("printing") or {}, res["printings"]))
+            added = self.add_card(res["printings"], res["card"], res.get("how"), res.get("printing"),
+                                  res.get("card_confidence"))
+            beep("dup" if added == "duplicate" else True)
         elif res["candidates"]:
             self.review = res
             beep(False)
@@ -801,27 +927,42 @@ class Scanner:
             return
         name = res["candidates"][i][0]
         self.set_status("Finding printing...", YELLOW)
-        prints = self.db.ranked_printings(name, res.get("footer_text", ""), self.settings.get("locked_set"), res["card"])
+        prints, choice = self.rec.printings_for(name, res["card"], res.get("footer_text", ""),
+                                                self.settings.get("locked_set"))
         self.review = None
         if prints:
-            self.add_card(prints, res["card"])
-            beep(True)
+            beep("dup" if self.add_card(prints, res["card"], "picked", choice) == "duplicate" else True)
 
-    def add_card(self, printings, card_img, how=None):
+    def add_card(self, printings, card_img, how=None, printing=None, card_conf=None):
+        """printing: the PrintingChoice from printing.py (confidence, uncertain, candidates)."""
         top = printings[0]
         finish = self.settings.get("default_finish", "nonfoil")
         if finish not in (top["finishes"] or "nonfoil").split(","):
             finish = (top["finishes"] or "nonfoil").split(",")[0]
         entry = dict(id=top["id"], finish=finish, alts=[p["id"] for p in printings[:40]], alt_idx=0, how=how,
                      time=datetime.now().isoformat(timespec="seconds"))
+        if printing:
+            entry.update(printing_conf=printing.get("confidence"), printing_uncertain=bool(printing.get("uncertain")),
+                         printing_reason=printing.get("reason"),
+                         alt_vis={c["id"]: c["visual"] for c in printing.get("candidates", []) if c.get("visual") is not None})
+        if card_conf is not None:
+            entry["card_conf"] = card_conf
         card = self.db.by_id(top["id"]) or dict(top)
+        if self.target.kind == "deck":
+            card = dict(card, oracle_text=self.oracle_text(card))
         result = self.target.add(self, entry, card)  # session / deck scan / commander pick
         if self.target.kind == "commander":
             self.ask_commander(result)
             return
-        self.set_status(f"+ {ascii_text(top['name'])}", GREEN)
-        if result:
-            self.ask_duplicate(result, entry)
+        if result and result.get("rejected"):
+            # Scan Deck: a copy Commander doesn't allow. Not added, no pop-up; the scanner
+            # stays locked on it, so it waits for this card to be taken away or covered.
+            self.set_status(f"Duplicate ignored: {ascii_text(result['name'])} - already in the deck", YELLOW)
+            return "duplicate"
+        if entry.get("printing_uncertain"):
+            self.set_status(f"+ {ascii_text(top['name'])} - printing uncertain (Choose to pick it)", YELLOW)
+        else:
+            self.set_status(f"+ {ascii_text(top['name'])}", GREEN)
 
     def save_session(self):
         self.target.save()
@@ -830,14 +971,30 @@ class Scanner:
         if not self.entries:
             return
         e = self.entries[-1]
-        e["alt_idx"] = (e["alt_idx"] + step) % len(e["alts"])
-        e["id"] = e["alts"][e["alt_idx"]]
+        self.set_printing(e, e["alts"][(e["alt_idx"] + step) % len(e["alts"])], quiet=True)
         card = self.db.by_id(e["id"])
-        finishes = (card["finishes"] or "nonfoil").split(",")
+        self.set_status(f"Printing {e['alt_idx'] + 1}/{len(e['alts'])}: {card['set_name']} #{card['collector_number']}", WHITE)
+
+    def set_printing(self, e, card_id, quiet=False):
+        """The user picked this printing for a scanned card: it's no longer uncertain."""
+        e["id"] = card_id
+        if card_id in e["alts"]:
+            e["alt_idx"] = e["alts"].index(card_id)
+        card = self.db.by_id(card_id) or {}
+        finishes = (card.get("finishes") or "nonfoil").split(",")
         if e["finish"] not in finishes:
             e["finish"] = finishes[0]
+        e["printing_uncertain"], e["printing_chosen"] = False, True
         self.save_session()
-        self.set_status(f"Printing {e['alt_idx'] + 1}/{len(e['alts'])}: {card['set_name']} #{card['collector_number']}", WHITE)
+        if not quiet:
+            self.set_status(f"Printing set: {card.get('set_name', '')} #{card.get('collector_number', '')}", GREEN)
+
+    def choose_printing(self):
+        """Pick the printing of the last scanned card from its likely printings."""
+        if not self.entries:
+            return
+        from printing_view import ChoosePrintingDialog
+        self.open_dialog(ChoosePrintingDialog(self, self.entries[-1]))
 
     def cycle_finish(self):
         if not self.entries:
@@ -909,16 +1066,20 @@ class Scanner:
         box = self.drag or self.zone
         if box:
             x0, y0, x1, y1 = [int(v * self.scale) for v in box]
-            color = YELLOW if self.busy else (GREEN if self.armed else GREY)
+            color = YELLOW if self.busy else (GREEN if self.armed and self.auto_scan else GREY)
             cv2.rectangle(canvas, (x0, y0), (x1, y1), color, 2)
             if self.background is None and not self.drag:
                 put(canvas, "Clear the box, then press B", (x0 + 6, y0 + 22), YELLOW, 0.55)
+            elif not self.auto_scan and not self.drag:
+                put(canvas, "SCANNER OFF - P to start", (x0 + 6, y0 + 22), GREY, 0.55)
+            elif self.locked and not self.busy and not self.drag:
+                put(canvas, "Scanned - waiting for next card", (x0 + 6, y0 + 22), GREY, 0.5)
         else:
             put(canvas, "Drag a box where your cards will land", (20, 40), YELLOW, 0.8)
 
         put(canvas, self.status, (12, VIEW_H + 24), self.status_color, 0.6)
-        put(canvas, "Drag on the video to move the scan box  -  B = learn background  -  SPACE = scan now  -  Q = quit",
-            (12, VIEW_H + 52), GREY, 0.42)
+        put(canvas, "P = start/stop scanning  -  SPACE = scan one card now  -  R = another identical copy  -  "
+                    "B = learn background  -  drag the video to move the box  -  Q = quit", (12, VIEW_H + 52), GREY, 0.42)
         self.draw_panel(canvas)
         return canvas
 
@@ -951,12 +1112,14 @@ class Scanner:
             last = dict(name=c.get("name", "?"), set_name=c.get("set_name", ""), set_code=c.get("set_code", ""),
                         number=c.get("collector_number", ""), rarity=c.get("rarity", ""), finish=e["finish"],
                         price=price, printing=e["alt_idx"] + 1, printings=len(e["alts"]), how=e.get("how"),
-                        image=self.thumb(e["id"], 296))
+                        image=self.thumb(e["id"], 296), uncertain=bool(e.get("printing_uncertain")),
+                        card_conf=e.get("card_conf"), printing_conf=e.get("printing_conf"),
+                        chosen=bool(e.get("printing_chosen")))
         recent = []
         for e in reversed(self.entries[-12:-1]):
             c, price = card_info(e)
             recent.append(dict(name=c.get("name", "?"), set_code=c.get("set_code", ""), finish=e["finish"],
-                               price=price, image=self.thumb(e["id"], 40)))
+                               price=price, image=self.thumb(e["id"], 40), uncertain=bool(e.get("printing_uncertain"))))
         review = None
         if self.review is not None:
             choices = []
@@ -975,20 +1138,27 @@ class Scanner:
                     show_destination=self.userdb is not None and self.target is self.normal_target,
                     destination=self.destination_name() if self.userdb is not None else None,
                     can_choose_destination=self.userdb is not None and len(self.userdb.collections()) > 1,
-                    pending=len(self.pending_entries()))
+                    pending=len(self.pending_entries()), auto_scan=self.auto_scan)
         key = (len(self.entries), round(total, 2), round(rate), view["lock"], view["foil_default"], self.cam_index,
-               (self.entries[-1]["id"], self.entries[-1]["finish"], self.entries[-1]["alt_idx"]) if self.entries else None,
+               (self.entries[-1]["id"], self.entries[-1]["finish"], self.entries[-1]["alt_idx"],
+                self.entries[-1].get("printing_uncertain")) if self.entries else None,
                id(self.review), repr(self.typing), self.bg_state, self.bg_menu, meta.get("saved_at"),
                display_currency(self.settings), view["destination"], view["can_choose_destination"], view["pending"],
-               repr(view["deck_mode"]))
+               repr(view["deck_mode"]), self.auto_scan)
         return view, key
 
     def on_panel_click(self, x, y):
         for x0, y0, x1, y1, action in self.panel_buttons:
             if x0 <= x <= x1 and y0 <= y <= y1:
                 keys = dict(prev="[", next="]", foil="f", remove="u", export="e", lock="l", new="n", camera="c",
-                            search="s", skip="x")
-                if action == "add_collection":
+                            search="s", skip="x", choose="o")
+                if action == "view_last":
+                    if self.entries:
+                        from card_viewer import open_viewer
+                        open_viewer(self, self.db.by_id(self.entries[-1]["id"]))
+                elif action == "scan_toggle":
+                    self.set_auto_scan(not self.auto_scan)
+                elif action == "add_collection":
                     self.add_to_collection()
                 elif action == "finish_deck":
                     self.finish_deck_scan()
@@ -1027,7 +1197,7 @@ class Scanner:
             if event == cv2.EVENT_LBUTTONDOWN:
                 self.dialog.click(x, y)
             elif event == cv2.EVENT_MOUSEWHEEL and hasattr(self.dialog, "wheel"):
-                self.dialog.wheel(cv2.getMouseWheelDelta(flags))
+                self.dialog.wheel(wheel_delta(flags))
             if self.dialog is not None and self.dialog.done:
                 self.dialog = None
             return
@@ -1048,19 +1218,23 @@ class Scanner:
             if event == cv2.EVENT_LBUTTONDOWN:
                 self.collection_screen.click(x, y, self._screen_hits)
             elif event == cv2.EVENT_MOUSEWHEEL:
-                self.collection_screen.wheel(cv2.getMouseWheelDelta(flags))
+                self.collection_screen.wheel(wheel_delta(flags))
             return
         if self.tab == "decks" and self.decks_screen is not None:
             if event == cv2.EVENT_LBUTTONDOWN:
                 self.decks_screen.click(x, y, self._screen_hits)
             elif event == cv2.EVENT_MOUSEWHEEL:
-                self.decks_screen.wheel(cv2.getMouseWheelDelta(flags))
+                self.decks_screen.wheel(wheel_delta(flags))
+            elif event == cv2.EVENT_MOUSEMOVE and flags & cv2.EVENT_FLAG_LBUTTON:
+                self.decks_screen.drag(x, y)  # dragging the list's scrollbar
+            elif event == cv2.EVENT_LBUTTONUP:
+                self.decks_screen.release()
             return
         if self.tab == "analyse" and self.analyse_screen is not None:
             if event == cv2.EVENT_LBUTTONDOWN:
                 self.analyse_screen.click(x, y, self._screen_hits)
             elif event == cv2.EVENT_MOUSEWHEEL:
-                self.analyse_screen.wheel(cv2.getMouseWheelDelta(flags))
+                self.analyse_screen.wheel(wheel_delta(flags))
             return
         if self.tab != "scanner":
             return
@@ -1153,6 +1327,12 @@ class Scanner:
             self.clear_background()
         elif key == 32 and self.zone and self.last_frame is not None and not self.busy:
             self.start_scan(self.last_frame, manual=True)
+        elif ch == "p":
+            self.set_auto_scan(not self.auto_scan)
+        elif ch == "o":
+            self.choose_printing()
+        elif ch == "r":
+            self.rescan_copy()
         elif ch == "f":
             self.cycle_finish()
         elif ch == "]":
@@ -1239,11 +1419,10 @@ class Scanner:
             return
         name = t["matches"][t["sel"]]
         card_img = self.review["card"] if self.review is not None else None
-        prints = self.db.ranked_printings(name, "", self.settings.get("locked_set"), card_img)
+        prints, choice = self.rec.printings_for(name, card_img, "", self.settings.get("locked_set"))
         self.review = None
         if prints:
-            self.add_card(prints, card_img)
-            beep(True)
+            beep("dup" if self.add_card(prints, card_img, "typed", choice) == "duplicate" else True)
 
     def refresh(self):
         if self.last_frame is not None:
@@ -1258,7 +1437,7 @@ class Scanner:
         if not self.zone:
             self.set_status("Drag a box where cards will land", WHITE)
         elif self.bg_state == "ok":
-            self.set_status("Ready - background loaded", GREEN)
+            self.set_status("Ready - background loaded. Scanner is OFF: press Start Scan (P) when ready", GREEN)
         elif self.bg_state == "stale":
             self.set_status("Background is for a different camera/box - clear the box and press B", YELLOW)
         else:
@@ -1299,6 +1478,16 @@ class Scanner:
         self.cap.release()
         cv2.destroyAllWindows()
         print(f"Saved {len(self.entries)} cards. Press E next time to export, or they'll still be here.")
+
+
+def wheel_delta(flags):
+    """Mouse-wheel amount from an OpenCV mouse event (+ = away from you / up). OpenCV 5's
+    Python module no longer has cv2.getMouseWheelDelta, so decode the high 16 bits
+    (a signed number) ourselves."""
+    if hasattr(cv2, "getMouseWheelDelta"):
+        return cv2.getMouseWheelDelta(flags)
+    d = (int(flags) >> 16) & 0xFFFF
+    return d - 0x10000 if d >= 0x8000 else d
 
 
 def put(img, text, org, color, scale):

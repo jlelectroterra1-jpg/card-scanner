@@ -3,6 +3,8 @@ import cv2
 import numpy as np
 from rapidocr import RapidOCR
 
+from printing import PrintingMatcher
+
 CARD_W, CARD_H = 630, 880  # 63 x 88 mm, the size of a Magic card
 
 # Regions of a straightened card, as fractions of (x0, y0, x1, y1).
@@ -60,6 +62,11 @@ class Recognizer:
         self.db = db
         self.ocr = RapidOCR(params={"Global.log_level": "error"})
         self.visual = visual_index
+        self.matcher = PrintingMatcher(db, visual_index)  # stage 2: which printing (printing.py)
+
+    def printings_for(self, name, card_bgr=None, footer_text="", locked_set=None):
+        """Stage 2: (printings best-first, PrintingChoice) for a card already identified."""
+        return self.matcher.choose(name, card_bgr, footer_text, locked_set)
 
     # ---- geometry -------------------------------------------------------
 
@@ -178,9 +185,11 @@ class Recognizer:
                 # Reprints share artwork; on a close card the set code / number in the
                 # bottom-left corner tells them apart (~20 ms; junk from far away is ignored).
                 footer = " ".join(self.read_line(img, b, height=40) for b in FOOTER_LINES)
+                printings, choice = self.printings_for(name, img, footer, locked_set)
+                gap = vis[0][2] - vis[1][2]
                 return dict(name_text="", footer_text=footer, candidates=[(n, 100 * max(0.0, sc)) for n, _, sc in vis],
-                            printings=self.db.printings_for_art(name, art_id, locked_set, footer, img),
-                            confident=True, card=img, how="picture")
+                            printings=printings, printing=choice, confident=True, card=img, how="picture",
+                            card_confidence=round(min(0.99, 0.75 + gap), 3))
         return None
 
     def identify(self, card_bgr, locked_set=None):
@@ -251,9 +260,12 @@ class Recognizer:
                         card=best["img"], how="none")
         name = candidates[0][0]
         footer = " ".join(self.read_line(best["img"], b, height=40) for b in FOOTER_LINES)
+        printings, choice = self.printings_for(name, best["img"], footer, locked_set)
+        card_conf = 0.99 if how == "name+picture" else (min(0.99, 0.75 + vis_gap) if how == "picture"
+                                                        else round(candidates[0][1] / 100, 3))
         return dict(
             name_text=best["name_text"], footer_text=footer, candidates=candidates,
-            printings=self.db.ranked_printings(name, footer, locked_set, best["img"]),
+            printings=printings, printing=choice, card_confidence=round(card_conf if confident else min(card_conf, 0.6), 3),
             confident=confident, card=best["img"], how=how,
         )
 

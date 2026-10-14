@@ -2,6 +2,7 @@
 
 Kept deliberately small and data-driven so special cases can be added later:
 add names to ANY_NUMBER / UP_TO, or extend `warnings()`."""
+import re
 
 DECK_SIZE = 100
 BASIC_NAMES = {"Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes",
@@ -9,7 +10,8 @@ BASIC_NAMES = {"Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes",
                "Snow-Covered Mountain", "Snow-Covered Forest", "Snow-Covered Wastes"}
 # "A deck can have any number of cards named ..."
 ANY_NUMBER = {"Relentless Rats", "Shadowborn Apostle", "Persistent Petitioners", "Rat Colony", "Dragon's Approach",
-              "Slime Against Humanity", "Hare Apparent", "Templar Knight", "Tempest Hawk", "Cid, Timeless Artificer"}
+              "Slime Against Humanity", "Hare Apparent", "Templar Knight", "Tempest Hawk", "Cid, Timeless Artificer",
+              "Sphinx's Approach"}
 # "A deck can have up to N cards named ..."
 UP_TO = {"Seven Dwarves": 7, "Nazgûl": 9}
 
@@ -29,11 +31,26 @@ def is_basic(name, type_line=None):
     return name in BASIC_NAMES or bool(type_line and "Basic Land" in type_line)
 
 
-def copy_limit(name, type_line=None):
-    """How many copies a Commander deck may have (None = no limit)."""
+_NUMBER_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+                 "ten": 10, "eleven": 11, "twelve": 12}
+
+
+def copy_limit(name, type_line=None, oracle_text=None):
+    """How many copies a Commander deck may have (None = no limit). Uses the lists above
+    and, when given, the card's own rules text ("A deck can have any number of cards
+    named ..." / "A deck can have up to seven cards named ...")."""
     if is_basic(name, type_line) or name in ANY_NUMBER:
         return None
-    return UP_TO.get(name, 1)
+    if name in UP_TO:
+        return UP_TO[name]
+    text = (oracle_text or "").lower()
+    if "a deck can have any number of cards named" in text:
+        return None
+    m = re.search(r"a deck can have up to (\w+) cards named", text)
+    if m:
+        word = m.group(1)
+        return int(word) if word.isdigit() else _NUMBER_WORDS.get(word, 1)
+    return 1
 
 
 def group_of(type_line, role="main"):

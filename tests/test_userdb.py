@@ -149,7 +149,7 @@ class UserDBTests(unittest.TestCase):
         self.assertAlmostEqual(db.collection_value(), 1.5 * 3 + 2.0)
         self.assertAlmostEqual(db.collection_value(trade), 3.0)
         self.assertEqual(db.collection_id("trade binder"), trade)
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(UserDBError):  # names are unique (clear message)
             db.create_collection("Trade Binder")
         # a collection that still holds cards can't be deleted by accident
         with self.assertRaises(sqlite3.IntegrityError):

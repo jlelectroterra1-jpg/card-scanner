@@ -233,6 +233,72 @@ class CollectionStore:
         r = self.conn.execute(f"SELECT * FROM scry.cards WHERE {where} LIMIT 1", args).fetchone()
         return dict(r) if r else None
 
+    # ---- correcting a lot's printing / finish ----------------------------------------
+
+    def card(self, scryfall_id):
+        return self._card("id = ?", scryfall_id)
+
+    def printings_for(self, item):
+        """Every known printing of this lot's card - found by oracle ID (from the lot, or
+        from its current printing); the name is only used when neither is known.
+        Newest first, English before other languages."""
+        if not self.has_cards_db:
+            return []
+        oracle = item.get("oracle_id") or (self.card(item["scryfall_id"]) or {}).get("oracle_id")
+        order = "ORDER BY lang = 'en' DESC, released_at DESC, set_code, CAST(collector_number AS INTEGER), collector_number"
+        if oracle:
+            rows = self.conn.execute(f"SELECT * FROM scry.cards WHERE oracle_id = ? {order}", (oracle,))
+        else:
+            rows = self.conn.execute(f"SELECT * FROM scry.cards WHERE name = ? COLLATE NOCASE {order}",
+                                     (item["card_name"],))
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def finishes_of(card):
+        """The finishes Scryfall lists for a printing (in nonfoil / foil / etched order)."""
+        have = set((card or {}).get("finishes", "").split(","))
+        return [f for f in FINISHES if f in have]
+
+    @staticmethod
+    def price_of(card, finish):
+        """Scryfall's USD price for exactly this printing + finish (None if it has none)."""
+        v = (card or {}).get({"nonfoil": "usd", "foil": "usd_foil", "etched": "usd_etched"}[finish])
+        return float(v) if v not in (None, "") else None
+
+    def merge_check(self, item_id, scryfall_id=None, finish=None):
+        """If the change would merge this lot into another identical one:
+        dict(target=<lot>, conflicts=[...]) - else None."""
+        item = self.udb.item(item_id)
+        card = self.card(scryfall_id) if scryfall_id else None
+        target = self.udb.merge_target(item_id, scryfall_id=scryfall_id, finish=finish,
+                                       language=(card or {}).get("lang"))
+        if target is None:
+            return None
+        return dict(target=target, conflicts=self.udb.merge_conflicts(item, target))
+
+    def change_finish(self, item_id, finish):
+        """Switch a lot to another finish that exists for its printing; price follows."""
+        item = self.udb.item(item_id)
+        card = self.card(item["scryfall_id"])
+        if card is not None and finish not in self.finishes_of(card):
+            raise ValueError(f"{card['name']} ({card['set_code'].upper()} #{card['collector_number']}) "
+                             f"doesn't exist in {finish}")
+        return self.udb.change_finish(item_id, finish, market_price=self.price_of(card, finish) if card else None)
+
+    def change_printing(self, item_id, scryfall_id, finish=None):
+        """Correct a lot to another exact printing. Keeps its finish when that printing has
+        it (else the first finish it does have, or the one asked for)."""
+        item = self.udb.item(item_id)
+        card = self.card(scryfall_id)
+        if card is None:
+            raise ValueError("that printing isn't in the card data")
+        finishes = self.finishes_of(card) or ["nonfoil"]
+        finish = finish or (item["finish"] if item["finish"] in finishes else finishes[0])
+        if finish not in finishes:
+            raise ValueError(f"that printing doesn't exist in {finish}")
+        return self.udb.change_printing(item_id, card, finish, market_price=self.price_of(card, finish),
+                                        finishes=finishes)
+
     def commit_import(self, parsed, collection_id, include_name_matches=False, source_name=""):
         """Add matched rows in one transaction. Uncertain (name-only) rows are only added
         when include_name_matches is True. Returns (copies added, rows added)."""

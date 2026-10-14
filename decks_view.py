@@ -27,7 +27,10 @@ OWN_SHORT = {"exact": "Owned - exact", "different_finish": "Owned - other finish
              "different_printing": "Owned - other printing", "deck_only": "Deck only",
              "available": "In Collection (link)", "in_use": "In another deck", "missing": "Not owned"}
 LIST_X0, LIST_X1, PANE_X0 = 16, 930, 946
-ROW_H, GROUP_H = 34, 26
+ROW_H, GROUP_H = 46, 26
+THUMB_W, THUMB_H = 30, 42  # list thumbnails (Magic card ratio 63:88)
+WHEEL_LINES = 4  # rows per mouse-wheel step in the deck card list
+SB_W = 8         # deck list scrollbar width
 
 
 def when(ts):
@@ -112,6 +115,7 @@ class DecksScreen:
         self.scroll = self.list_scroll = 0
         self.open_dd = None
         self.decks, self.rows, self.info = [], [], None
+        self.protected = set()  # cards the analyser must never suggest cutting (this deck)
         self.version = 0
         self._key = self._cache = None
         self.images = Images(self.bump)
@@ -130,6 +134,7 @@ class DecksScreen:
             else:
                 self.rows = self.store.deck_cards(self.deck_id)
                 self.info = self.store.summary(self.deck_id, self.rows)
+                self.protected = self.app.userdb.protected_cards(self.deck_id)
                 if self.selected is not None and self.selected not in {r["id"] for r in self.rows}:
                     self.selected = None
         self.bump()
@@ -269,6 +274,7 @@ class DecksScreen:
         scan_label = f"Resume scan ({len(pending['entries'])})" if scanning_this else "Scan Deck"
         anchors = {}
         for label, action, style in reversed([(scan_label, "scan", "primary"), ("Add Card", "add", "normal"),
+                                              ("Print Deck", "print", "normal"),
                                               ("Commander", "dd:commander", "dd"), ("More", "dd:more", "dd")]):
             w = p.f["button"].getlength(label) + (40 if style == "dd" else 28)
             if style == "dd":
@@ -339,6 +345,7 @@ class DecksScreen:
         else:
             maxs = 0
         self.scroll = max(0, min(self.scroll, maxs))
+        self._sb = dict(top=top, bottom=self.H - 8, total=len(lines), maxs=maxs, visible=0, thumb=None)
         y = top
         if not lines:
             p.text(((LIST_X0 + LIST_X1) / 2, top + 120), "No cards yet - press Scan Deck, Add Card or Import",
@@ -354,27 +361,89 @@ class DecksScreen:
                 y += h
                 continue
             r = line[1]
+            cy = (h - 2) // 2  # vertical centre of the row
             bg = ROW_SEL if r["id"] == self.selected else (ROW_ALT if i % 2 else BG)
             p.d.rectangle((LIST_X0, y, LIST_X1 - 12, y + h - 2), fill=bg)
-            p.paste(self.images.small(r["scryfall_id"], r.get("image_small"), 22, 31), LIST_X0 + 4, y + 1, 22, 31,
-                    radius=3)
-            p.text((LIST_X0 + 34, y + 16), f"{r['quantity']}", font="rowb", fill=MUTED, anchor="lm")
+            p.paste(self.images.small(r["scryfall_id"], r.get("image_small"), THUMB_W, THUMB_H), LIST_X0 + 4,
+                    y + (h - 2 - THUMB_H) // 2, THUMB_W, THUMB_H, radius=3)
+            p.text((LIST_X0 + 42, y + cy), f"{r['quantity']}", font="rowb", fill=MUTED, anchor="lm")
             name = r["card_name"] + ("  (commander)" if r["role"] == "commander" else
                                      "  (partner)" if r["role"] == "partner" else "")
-            p.text((LIST_X0 + 54, y + 16), name, font="rowb", anchor="lm", width=300,
+            p.text((LIST_X0 + 62, y + cy), name, font="rowb", anchor="lm", width=292,
                    fill=YELLOW if r["role"] in ("commander", "partner") else TEXT)
             if r["card_name"] in problem:
-                p.text((LIST_X0 + 362, y + 16), "!", font="rowb", fill=RED, anchor="lm")
-            p.text((LIST_X0 + 380, y + 16), f"{(r.get('set_code') or '').upper()} #{num(r.get('collector_number'))}",
+                p.text((LIST_X0 + 362, y + cy), "!", font="rowb", fill=RED, anchor="lm")
+            p.text((LIST_X0 + 380, y + cy), f"{(r.get('set_code') or '').upper()} #{num(r.get('collector_number'))}",
                    font="small", fill=MUTED, anchor="lm", width=96)
-            p.text((LIST_X0 + 482, y + 16), finish_label(r["finish"] or "nonfoil"), font="small",
+            p.text((LIST_X0 + 482, y + cy), finish_label(r["finish"] or "nonfoil"), font="small",
                    fill=YELLOW if (r["finish"] or "nonfoil") != "nonfoil" else MUTED, anchor="lm")
-            p.text((LIST_X0 + 620, y + 16), self.money(r["price"]), font="row", anchor="rm",
+            p.text((LIST_X0 + 620, y + cy), self.money(r["price"]), font="row", anchor="rm",
                    fill=GOLD if r["price"] >= HIGH_VALUE else MUTED)
-            p.text((LIST_X0 + 640, y + 16), OWN_SHORT[r["ownership"]], font="small", fill=OWN_COLOUR[r["ownership"]],
-                   anchor="lm", width=250)
+            p.text((LIST_X0 + 640, y + cy), OWN_SHORT[r["ownership"]], font="small", fill=OWN_COLOUR[r["ownership"]],
+                   anchor="lm", width=170)
+            if r["card_name"] in self.protected:
+                p.text((LIST_X1 - 22, y + cy), "protected", font="label", fill=GREEN, anchor="rm")
             p.hit((LIST_X0, y, LIST_X1 - 12, y + h - 2), ("card", r["id"]))
             y += h
+        self._sb["visible"] = sum(1 for i in range(self.scroll, len(lines))
+                                  if top + sum(heights[self.scroll:i + 1]) <= self.H - 6)
+        self._scrollbar(p)
+
+    def _scrollbar(self, p):
+        """Vertical scrollbar for the deck card list: shows where you are; click above /
+        below the thumb to page, drag the thumb to scroll."""
+        sb = self._sb
+        x1 = LIST_X1 - 1
+        x0 = x1 - SB_W
+        t0, t1 = sb["top"], sb["bottom"]
+        p.d.rounded_rectangle((x0, t0, x1, t1), radius=4, fill=CARD_BG)
+        if sb["maxs"] <= 0:
+            return  # everything fits
+        h = max(28, (t1 - t0) * sb["visible"] / max(1, sb["total"]))
+        ty = t0 + (t1 - t0 - h) * self.scroll / sb["maxs"]
+        sb["thumb"] = (ty, ty + h)
+        p.d.rounded_rectangle((x0, ty, x1, ty + h), radius=4,
+                              fill=YELLOW if self._drag is not None else (110, 114, 126))
+        p.hit((x0 - 6, t0, x1 + 4, t1), ("sb", "track"))
+        p.hit((x0 - 6, ty, x1 + 4, ty + h), ("sb", "thumb"))
+
+    # ---- deck list scrolling ----------------------------------------------------------
+
+    _sb = None
+    _drag = None  # offset of the pointer inside the thumb while dragging it
+
+    def max_scroll(self):
+        if self._sb is None or self._sb.get("total") != len(self.display_rows()):
+            self.render()  # (geometry of the current list)
+        return self._sb["maxs"] if self._sb else 0
+
+    def page(self):
+        """Lines per Page Up / Down: the card rows that fit, minus one for overlap. Fixed
+        (not "what's on screen now", which changes with group headings), so Page Down then
+        Page Up comes back to the same place."""
+        sb = self._sb or dict(top=0, bottom=10 * ROW_H)
+        return max(1, (sb["bottom"] - sb["top"]) // ROW_H - 1)
+
+    def scroll_to(self, line):
+        self.scroll = max(0, min(int(line), self.max_scroll()))
+        self.bump()
+
+    def scroll_by(self, n):
+        self.scroll_to(self.scroll + n)
+
+    def drag(self, x, y):
+        """Mouse moved with the button held: move the thumb (only while dragging it)."""
+        sb = self._sb
+        if self._drag is None or not sb or not sb["thumb"]:
+            return
+        th = sb["thumb"][1] - sb["thumb"][0]
+        room = max(1, sb["bottom"] - sb["top"] - th)
+        self.scroll_to(round((y - self._drag - sb["top"]) / room * sb["maxs"]))
+
+    def release(self):
+        if self._drag is not None:
+            self._drag = None
+            self.bump()
 
     def _pane(self, p, title=""):
         x0, y0, x1, y1 = PANE_X0, 56, self.W - 16, self.H - 10
@@ -391,6 +460,7 @@ class DecksScreen:
             c = cmds[0]
             p.paste(self.images.large(c["scryfall_id"], c.get("image_normal"), c.get("image_small")), x0 + 14, y0 + 14,
                     130, 181, radius=7)
+            p.hit((x0 + 14, y0 + 14, x0 + 144, y0 + 195), ("view", c["scryfall_id"]))
             if len(cmds) > 1:
                 c2 = cmds[1]
                 p.paste(self.images.small(c2["scryfall_id"], c2.get("image_small")), x0 + 100, y0 + 120, 60, 84,
@@ -458,6 +528,7 @@ class DecksScreen:
         iw, ih = 150, 209
         p.paste(self.images.large(r["scryfall_id"], r.get("image_normal"), r.get("image_small")), x0 + 14, y0 + 14,
                 iw, ih, radius=7)
+        p.hit((x0 + 14, y0 + 14, x0 + 14 + iw, y0 + 14 + ih), ("view", r["scryfall_id"]))  # click = large viewer
         tx, tw = x0 + 14 + iw + 14, x1 - (x0 + 14 + iw + 14) - 40
         y = y0 + 16
         for line in _wrap(p, r["card_name"], "name", tw + 30)[:2]:
@@ -526,6 +597,14 @@ class DecksScreen:
             p.button((x0 + 16, y, x0 + 16 + half, y + 28), "Make commander", ("role", "commander"), font="label")
         if r["role"] != "partner":
             p.button((x0 + 22 + half, y, x1 - 16, y + 28), "Make partner", ("role", "partner"), font="label")
+        if r["role"] == "main":
+            y += 34
+            if r["card_name"] in self.protected:
+                p.button((x0 + 16, y, x1 - 16, y + 28), "Protected from cut suggestions - Unprotect",
+                         ("protect", False), font="label")
+            else:
+                p.button((x0 + 16, y, x1 - 16, y + 28), "Protect from cuts (the analyser will never suggest cutting it)",
+                         ("protect", True), font="label")
         y = y1 - 40
         p.button((x0 + 16, y, x1 - 16, y + 30), "Remove from deck", "remove", style="danger")
 
@@ -548,8 +627,17 @@ class DecksScreen:
             self.menu(action[1])
         elif isinstance(action, tuple) and action[0] == "open":
             self.open_deck(action[1])
+        elif isinstance(action, tuple) and action[0] == "view":
+            from card_viewer import open_viewer
+            open_viewer(self.app, self.store.card(action[1]))
         elif isinstance(action, tuple) and action[0] == "card":
             self.selected = None if self.selected == action[1] else action[1]
+        elif isinstance(action, tuple) and action[0] == "sb":
+            thumb = (self._sb or {}).get("thumb")
+            if action[1] == "thumb" and thumb:
+                self._drag = y - thumb[0]
+            elif thumb:
+                self.scroll_by(-self.page() if y < thumb[0] else self.page())
         elif isinstance(action, tuple) and action[0] == "group":
             self.grouping, self.scroll = action[1], 0
         elif isinstance(action, tuple) and action[0] == "sort":
@@ -567,7 +655,7 @@ class DecksScreen:
         if self.view == "list":
             self.list_scroll = max(0, self.list_scroll + (-1 if delta > 0 else 1))
         else:
-            self.scroll = max(0, self.scroll + (-3 if delta > 0 else 3))
+            self.scroll_by(-WHEEL_LINES if delta > 0 else WHEEL_LINES)
         self.bump()
 
     def key(self, key):
@@ -581,7 +669,18 @@ class DecksScreen:
                 self.refresh()
         elif key == 0x2E0000 and self.selected is not None:
             self.action("remove")
-        elif key in (0x210000, 0x260000):  # PgUp / Up
+        elif self.view == "deck" and key in (0x210000, 0x220000, 0x240000, 0x230000, 0x260000, 0x280000):
+            if key == 0x210000:      # Page Up
+                self.scroll_by(-self.page())
+            elif key == 0x220000:    # Page Down
+                self.scroll_by(self.page())
+            elif key == 0x240000:    # Home
+                self.scroll_to(0)
+            elif key == 0x230000:    # End
+                self.scroll_to(self.max_scroll())
+            else:                    # Up / Down arrows: a few rows, as before
+                self.scroll_by(-3 if key == 0x260000 else 3)
+        elif key in (0x210000, 0x260000):  # deck list (tiles): PgUp / Up
             self.wheel(1)
         elif key in (0x220000, 0x280000):
             self.wheel(-1)
@@ -622,6 +721,8 @@ class DecksScreen:
             return self.app.start_deck_scan(self.deck_id)
         if action == "add":
             return self.app.open_dialog(CardPicker(self, "Add a card", self._add_picked))
+        if action == "print":
+            return self.print_deck()
         r = next((x for x in self.rows if x["id"] == self.selected), None)
         if r is None:
             return
@@ -647,6 +748,10 @@ class DecksScreen:
             return self.choose_copy(r)
         elif isinstance(action, tuple) and action[0] == "role":
             self._guard(udb.set_role, r["id"], action[1])
+        elif isinstance(action, tuple) and action[0] == "protect":
+            udb.protect_card(self.deck_id, r["card_name"], action[1])
+            self.app.toast(f"{r['card_name']} will never be suggested as a cut" if action[1]
+                           else f"{r['card_name']} can be suggested as a cut again", GREEN)
         elif action == "remove":
             return self.confirm_remove(r)
         self.refresh()
@@ -776,6 +881,16 @@ class DecksScreen:
             [f"The deck and its list of {info['count']} cards are deleted. Cards in your Collection stay there - "
              "copies this deck was using simply become free again."],
             buttons=[("Cancel", None, "normal"), ("Delete deck", True, "danger")], on_done=done))
+
+    def print_deck(self):
+        """Print Deck: this deck's exact printings and quantities, as a Word document of real-size
+        cards (print_view / printdeck). Nothing in the deck changes."""
+        import printdeck
+        from print_view import PrintDialog
+        items = printdeck.items_from_deck(self.store, self.deck_id)
+        if not items:
+            return self.app.toast("This deck has no cards to print yet", YELLOW)
+        self.app.open_dialog(PrintDialog(self.app, items, (self.info or {}).get("name") or "Deck"))
 
     def export(self):
         txt, csv_path = self.store.export(self.deck_id, self.app.export_dir())

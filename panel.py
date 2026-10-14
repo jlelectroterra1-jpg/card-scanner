@@ -105,10 +105,11 @@ class Panel:
         d.text((p, 14), f"{v['count']} card{'s' if v['count'] != 1 else ''}", font=self.f["big"], fill=TEXT)
         total = _money(v, v['total'])
         d.text((self.W - p, 14), total, font=self.f["big"], fill=GOLD if v["total"] >= 100 else TEXT, anchor="ra")
-        x = p
-        sub = f"{v['rate']:.0f} cards/min" if v["rate"] else "ready to scan"
-        d.text((x, 56), sub, font=self.f["small"], fill=MUTED, anchor="lm")
-        x += self.f["small"].getlength(sub) + 10
+        x = self._scan_chip(d, p, 46, v)
+        if v["rate"] and v.get("auto_scan"):
+            sub = f"{v['rate']:.0f} cards/min"
+            d.text((x, 56), sub, font=self.f["small"], fill=MUTED, anchor="lm")
+            x += self.f["small"].getlength(sub) + 10
         if v.get("lock"):
             x = self._chip(d, x, 46, f"SET {v['lock'].upper()}", YELLOW)
         if v.get("foil_default"):
@@ -121,13 +122,45 @@ class Panel:
         d.text((self.W - p, 56), cam, font=self.f["small"], fill=MUTED, anchor="rm")
         d.line((p, 76, self.W - p, 76), fill=BUTTON, width=1)
 
+    def _scan_chip(self, d, x, y, v):
+        """SCANNING (green dot) / SCANNER OFF (red dot) - always visible in the header."""
+        on = v.get("auto_scan")
+        text = "SCANNING" if on else "SCANNER OFF"
+        w = self.f["label"].getlength(text) + 30
+        d.rounded_rectangle((x, y, x + w, y + 20), radius=10, fill=(30, 70, 44) if on else BUTTON)
+        d.ellipse((x + 8, y + 6, x + 16, y + 14), fill=GREEN if on else RED)
+        d.text((x + 22, y + 10), text, font=self.f["label"], fill=GREEN if on else TEXT, anchor="lm")
+        return x + w + 6
+
+    def _scan_control(self, d, v, buttons, top):
+        """The Start / Stop Scan button, between the last card and the recent list."""
+        p = 16
+        on = v.get("auto_scan")
+        box = (p, top, p + 190, top + 40)
+        if on:
+            d.rounded_rectangle(box, radius=10, fill=BUTTON_HI, outline=RED, width=2)
+            d.text(((box[0] + box[2]) / 2, top + 20), "Stop Scan  (P)", font=self.f["button"], fill=TEXT, anchor="mm")
+        else:
+            d.rounded_rectangle(box, radius=10, fill=GREEN)
+            d.text(((box[0] + box[2]) / 2, top + 20), "Start Scan  (P)", font=self.f["button"], fill=(10, 30, 16),
+                   anchor="mm")
+        buttons.append((*box, "scan_toggle"))
+        x = box[2] + 14
+        d.ellipse((x, top + 9, x + 10, top + 19), fill=GREEN if on else RED)
+        d.text((x + 16, top + 14), "Scanning: ON" if on else "Scanning: OFF", font=self.f["button"],
+               fill=GREEN if on else TEXT, anchor="lm")
+        d.text((x, top + 32), "scans when a card holds still" if on else "SPACE scans one card",
+               font=self.f["small"], fill=MUTED, anchor="lm")
+        return top + 50
+
     def _last_card(self, img, d, v, buttons, top):
         p = 16
         last = v["last"]
         if last is None:
             d.rounded_rectangle((p, top, self.W - p, top + 250), radius=12, fill=CARD_BG)
             d.text((self.W / 2, top + 95), "Put a card in the box", font=self.f["name"], fill=TEXT, anchor="mm")
-            for i, line in enumerate(["It scans by itself when the card holds still.",
+            for i, line in enumerate(["Press Start Scan, then it scans by itself" if not v.get("auto_scan") else
+                                      "It scans by itself when the card holds still.",
                                       "Take it away (or drop the next one on top)",
                                       "and keep going."]):
                 d.text((self.W / 2, top + 130 + i * 20), line, font=self.f["small"], fill=MUTED, anchor="mm")
@@ -135,6 +168,7 @@ class Panel:
         d.rounded_rectangle((p, top, self.W - p, top + 250), radius=12, fill=CARD_BG)
         iw, ih = 148, 206
         self._paste(img, last["image"], p + 10, top + 10, iw, ih)
+        buttons.append((p + 10, top + 10, p + 10 + iw, top + 10 + ih, "view_last"))  # click = large viewer
         x = p + 10 + iw + 14
         width = self.W - p - 10 - x
         y = top + 12
@@ -148,22 +182,41 @@ class Panel:
         d.text((x + 15, y), f"{last['set_code'].upper()} #{last['number']} · {last['rarity']}", font=self.f["small"], fill=MUTED)
         y += 26
         foil = last["finish"] != "nonfoil"
-        self._chip(d, x, y, last["finish"].upper() if foil else "NON-FOIL", YELLOW if foil else MUTED)
+        cx = self._chip(d, x, y, last["finish"].upper() if foil else "NON-FOIL", YELLOW if foil else MUTED)
+        uncertain = last.get("uncertain")
+        if uncertain:
+            self._chip(d, cx, y, "PRINTING UNCERTAIN", YELLOW)
         y += 32
         price = last["price"]
-        d.text((x, y), _money(v, price), font=self.f["price"], fill=GOLD if price >= HIGH_VALUE else TEXT)
+        # An uncertain printing's price is provisional ("~"): the cheapest regular printing was assumed.
+        ptxt = ("~" if uncertain else "") + _money(v, price)
+        d.text((x, y), ptxt, font=self.f["price"], fill=YELLOW if uncertain else (GOLD if price >= HIGH_VALUE else TEXT))
         y += 42
-        if last["printings"] > 1:
-            d.text((x, y), f"printing {last['printing']} of {last['printings']}", font=self.f["small"], fill=MUTED)
+        parts = []
+        if last.get("card_conf") is not None:
+            parts.append(f"card {last['card_conf']:.0%}")
+        if last.get("chosen"):
+            parts.append("printing chosen by you")
+        elif last.get("printing_conf") is not None:
+            parts.append(f"printing {last['printing_conf']:.0%}")
+        elif last["printings"] > 1:
+            parts.append(f"printing {last['printing']} of {last['printings']}")
+        if parts:
+            d.text((x, y), self._fit(" · ".join(parts), self.f["small"], width), font=self.f["small"],
+                   fill=YELLOW if uncertain else MUTED)
         if last.get("how"):
             d.text((x, y + 18), f"recognised by {last['how']}", font=self.f["small"], fill=MUTED)
         # Buttons along the bottom of the card block, under the picture.
-        labels = [("‹ Print", "prev", False), ("Print ›", "next", False), ("Foil", "foil", False), ("Remove", "remove", True)]
+        labels = [("‹ Print", "prev", False, False), ("Print ›", "next", False, False),
+                  ("Choose", "choose", False, bool(uncertain)), ("Foil", "foil", False, False),
+                  ("Remove", "remove", True, False)]
         bx, by = p + 10, top + 224
-        bw = (self.W - 2 * p - 20 - 3 * 6) / 4
-        for i, (label, action, danger) in enumerate(labels):
+        n = len(labels)
+        bw = (self.W - 2 * p - 20 - (n - 1) * 6) / n
+        for i, (label, action, danger, primary) in enumerate(labels):
             x0 = bx + i * (bw + 6)
-            self._button(d, (int(x0), by, int(x0 + bw), by + 22), label, action, buttons, danger=danger)
+            self._button(d, (int(x0), by, int(x0 + bw), by + 22), label, action, buttons, danger=danger,
+                         primary=primary)
         return top + 262
 
     def _recent(self, img, d, v, top, bottom):
@@ -178,7 +231,8 @@ class Panel:
             price = r["price"]
             ptxt = _money(v, price)
             pw = self.f["row"].getlength(ptxt)
-            name = r["name"] + (f" ({r['finish']})" if r["finish"] != "nonfoil" else "")
+            name = r["name"] + (f" ({r['finish']})" if r["finish"] != "nonfoil" else "") + \
+                (" - printing?" if r.get("uncertain") else "")
             d.text((p + 30, y + 14), self._fit(name, self.f["row"], self.W - 2 * p - 30 - pw - 60), font=self.f["row"],
                    fill=TEXT, anchor="lm")
             d.text((self.W - p - pw - 10, y + 14), r["set_code"].upper(), font=self.f["small"], fill=MUTED, anchor="rm")
@@ -218,8 +272,10 @@ class Panel:
             d.text((p, 64), "Put the commander in the box", font=self.f["small"], fill=MUTED)
             d.line((p, 84, self.W - p, 84), fill=BUTTON, width=1)
             return
+        chip_x = self.W - p - (self.f["label"].getlength("SCANNING" if v.get("auto_scan") else "SCANNER OFF") + 30)
+        self._scan_chip(d, chip_x, 8, v)
         x = self._chip(d, p, 8, "SCANNING DECK", YELLOW)
-        d.text((x + 4, 18), self._fit(dm["name"], self.f["button"], self.W - x - 20), font=self.f["button"],
+        d.text((x + 4, 18), self._fit(dm["name"], self.f["button"], chip_x - x - 14), font=self.f["button"],
                fill=TEXT, anchor="lm")
         n, size = dm["count"], dm["size"]
         if n == size:
@@ -351,6 +407,7 @@ class Panel:
             self._review(img, d, view, buttons, top)
         else:
             y = self._last_card(img, d, view, buttons, top)
+            y = self._scan_control(d, view, buttons, y - 4)
             footer_row = view.get("show_destination") or view.get("deck_mode")
             self._recent(img, d, view, y + 4, self.H - 96 if footer_row else self.H - 56)
             if view.get("deck_mode"):

@@ -32,6 +32,9 @@ CARDS_DB_PATH = os.path.join(HERE, "data", "cards.db")
 
 FINISHES = ("nonfoil", "foil", "etched")
 CONDITIONS = ("mint", "near_mint", "lightly_played", "moderately_played", "heavily_played", "damaged")
+# Added to a collection lot when the scanner wasn't sure of the exact printing (fix it with
+# Change printing in the Collection card panel).
+UNCONFIRMED_NOTE = "Printing not confirmed by scanner - check with Change printing"
 DECK_ROLES = ("commander", "partner", "companion", "main", "sideboard", "maybe")
 DEFAULT_COLLECTION = "Main Collection"
 NOW = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"
@@ -223,6 +226,31 @@ MIGRATIONS = [
             undone_at TEXT)""",
         """CREATE INDEX applied_changes_deck ON applied_changes(deck_id, id)""",
     ]),
+    (5, "Analyser: cards protected from cut suggestions (per deck)", [
+        f"""CREATE TABLE deck_protected_cards (
+            deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+            card_name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT ({NOW}),
+            PRIMARY KEY (deck_id, card_name))""",
+    ]),
+    (6, "Analyser: per-deck card feedback (never cut / core card / not important)", [
+        f"""CREATE TABLE deck_card_flags (
+            deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+            card_name TEXT NOT NULL,
+            flag TEXT NOT NULL CHECK (flag IN ('never_cut', 'core', 'not_important')),
+            created_at TEXT NOT NULL DEFAULT ({NOW}),
+            PRIMARY KEY (deck_id, card_name, flag))""",
+        """INSERT INTO deck_card_flags (deck_id, card_name, flag, created_at)
+           SELECT deck_id, card_name, 'never_cut', created_at FROM deck_protected_cards""",
+    ]),
+    (7, "Analyser: feedback on suggested cards (good suggestion / not for this deck)", [
+        f"""CREATE TABLE deck_suggestion_feedback (
+            deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+            card_name TEXT NOT NULL,
+            verdict TEXT NOT NULL CHECK (verdict IN ('good', 'not_for_deck')),
+            created_at TEXT NOT NULL DEFAULT ({NOW}),
+            PRIMARY KEY (deck_id, card_name))""",
+    ]),
 ]
 LATEST_VERSION = MIGRATIONS[-1][0]
 
@@ -329,17 +357,39 @@ class UserDB:
     def default_collection_id(self):
         return self.conn.execute("SELECT id FROM collections WHERE is_default = 1").fetchone()[0]
 
+    @staticmethod
+    def clean_collection_name(name):
+        """Trim and collapse spaces; refuse blank names."""
+        name = " ".join((name or "").split())
+        if not name:
+            raise UserDBError("A collection needs a name")
+        if len(name) > 60:
+            raise UserDBError("That name is too long (60 characters at most)")
+        return name
+
+    def _check_unique_name(self, c, name, collection_id=None):
+        other = c.execute("SELECT id, name FROM collections WHERE name = ? COLLATE NOCASE AND id IS NOT ?",
+                          (name, collection_id)).fetchone()
+        if other is not None:
+            raise UserDBError(f'There is already a collection called "{other["name"]}" - pick another name')
+
     def create_collection(self, name, kind="collection", notes=None):
+        name = self.clean_collection_name(name)
         with self.transaction() as c:
+            self._check_unique_name(c, name)
             return c.execute("INSERT INTO collections (name, kind, notes) VALUES (?, ?, ?)",
-                             (name.strip(), kind, notes)).lastrowid
+                             (name, kind, notes)).lastrowid
 
     def rename_collection(self, collection_id, name):
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("a collection needs a name")
+        """Change ONLY the display name. The collection keeps its id, cards, deck links and
+        default flag (the main collection is found by its flag, never by its name)."""
+        name = self.clean_collection_name(name)
         with self.transaction() as c:
+            if c.execute("SELECT 1 FROM collections WHERE id = ?", (collection_id,)).fetchone() is None:
+                raise UserDBError("That collection no longer exists")
+            self._check_unique_name(c, name, collection_id)
             c.execute("UPDATE collections SET name = ? WHERE id = ?", (name, collection_id))
+        return name
 
     def collection_counts(self, collection_id):
         r = self.conn.execute("""SELECT COUNT(*), COALESCE(SUM(quantity), 0) FROM collection_items
@@ -490,27 +540,133 @@ class UserDB:
     def _move_lot(self, c, item_id, collection_id, finish=None, condition=None):
         """Move a lot to (collection, finish, condition), merging into an existing
         identical lot if there is one. Deck links follow the cards. Returns the lot id."""
+        return self._relocate(c, item_id, collection_id=collection_id, finish=finish, condition=condition)
+
+    @staticmethod
+    def _merge_target(c, item, collection_id, scryfall_id, finish, condition, language):
+        r = c.execute("""SELECT * FROM collection_items WHERE collection_id = ? AND scryfall_id = ? AND finish = ?
+                         AND condition = ? AND language = ? AND id != ?""",
+                      (collection_id, scryfall_id, finish, condition, language, item["id"])).fetchone()
+        return dict(r) if r else None
+
+    def merge_target(self, item_id, collection_id=None, scryfall_id=None, finish=None, condition=None,
+                     language=None):
+        """The other lot this one would be merged into after such a change (or None)."""
+        item = self.item(item_id)
+        if item is None:
+            raise ValueError("no such collection item")
+        return self._merge_target(self.conn, item, collection_id or item["collection_id"],
+                                  scryfall_id or item["scryfall_id"], finish or item["finish"],
+                                  condition or item["condition"], language or item["language"])
+
+    @staticmethod
+    def merge_conflicts(item, target):
+        """What would need combining if these two lots were merged: [] or a list of
+        plain-English differences (purchase price, notes)."""
+        out = []
+        if item["purchase_price"] is not None and target["purchase_price"] is not None and (
+                abs(item["purchase_price"] - target["purchase_price"]) > 0.005
+                or (item["purchase_currency"] or "USD") != (target["purchase_currency"] or "USD")):
+            out.append("purchase price")
+        if item["notes"] and target["notes"] and item["notes"] != target["notes"]:
+            out.append("notes")
+        return out
+
+    @staticmethod
+    def _join_notes(a, b):
+        if not b or b == a:
+            return a
+        if not a:
+            return b
+        return a + " / " + b
+
+    def _merge_into(self, c, item, target):
+        """Put lot `item`'s copies into lot `target`. Nothing is lost: different notes are
+        joined; different purchase prices become the average per copy (same currency) and
+        the original prices are written into the notes. Deck links move with the cards."""
+        notes = self._join_notes(target["notes"], item["notes"])
+        pp, pc = target["purchase_price"], target["purchase_currency"]
+        if item["purchase_price"] is not None:
+            ip, ic = item["purchase_price"], item["purchase_currency"]
+            if pp is None:
+                pp, pc = ip, ic
+            elif (pc or "USD") == (ic or "USD") and abs(pp - ip) > 0.005:
+                tq, iq = target["quantity"], item["quantity"]
+                notes = self._join_notes(notes, f"bought {tq} @ {pp:.2f} and {iq} @ {ip:.2f} {pc or 'USD'}")
+                pp = (pp * tq + ip * iq) / (tq + iq) if tq + iq else pp
+            elif (pc or "USD") != (ic or "USD"):
+                notes = self._join_notes(notes, f"{item['quantity']} bought @ {ip:.2f} {ic or 'USD'}")
+        c.execute("""UPDATE collection_items SET quantity = quantity + ?, purchase_price = ?, purchase_currency = ?,
+                        notes = ?, added_at = MIN(added_at, ?) WHERE id = ?""",
+                  (item["quantity"], pp, pc, notes, item["added_at"], target["id"]))
+        c.execute("UPDATE deck_cards SET collection_item_id = ? WHERE collection_item_id = ?", (target["id"], item["id"]))
+        c.execute("DELETE FROM collection_items WHERE id = ?", (item["id"],))
+        return target["id"]
+
+    def _relocate(self, c, item_id, collection_id=None, card=None, finish=None, condition=None,
+                  market_price=_UNSET, finishes=None):
+        """Change where / what a physical lot is: collection, exact printing (card = a
+        cards.db row: id, name, oracle_id, set_code, collector_number, lang), finish,
+        condition. It stays the same lot (quantity, purchase price, notes, date added and
+        deck links kept); if an identical lot already exists the two are merged. Deck cards
+        linked to it follow the corrected printing/finish. Returns the lot id."""
         item = c.execute("SELECT * FROM collection_items WHERE id = ?", (item_id,)).fetchone()
-        finish, condition = finish or item["finish"], condition or item["condition"]
-        other = c.execute("""SELECT id FROM collection_items WHERE collection_id = ? AND scryfall_id = ?
-                             AND finish = ? AND condition = ? AND language = ? AND id != ?""",
-                          (collection_id, item["scryfall_id"], finish, condition, item["language"], item_id)).fetchone()
-        if other is None:
-            c.execute("UPDATE collection_items SET collection_id = ?, finish = ?, condition = ? WHERE id = ?",
-                      (collection_id, finish, condition, item_id))
-            return item_id
-        target = other[0]
-        c.execute("""UPDATE collection_items SET quantity = quantity + ?,
-                        purchase_price = COALESCE(purchase_price, ?), purchase_currency = COALESCE(purchase_currency, ?),
-                        notes = CASE WHEN notes IS NULL THEN ? WHEN ? IS NULL OR ? = notes THEN notes
-                                     ELSE notes || ' / ' || ? END,
-                        added_at = MIN(added_at, ?)
-                     WHERE id = ?""",
-                  (item["quantity"], item["purchase_price"], item["purchase_currency"], item["notes"],
-                   item["notes"], item["notes"], item["notes"], item["added_at"], target))
-        c.execute("UPDATE deck_cards SET collection_item_id = ? WHERE collection_item_id = ?", (target, item_id))
-        c.execute("DELETE FROM collection_items WHERE id = ?", (item_id,))
-        return target
+        if item is None:
+            raise ValueError("no such collection item")
+        item = dict(item)
+        new = dict(collection_id=collection_id or item["collection_id"], finish=finish or item["finish"],
+                   condition=condition or item["condition"], scryfall_id=item["scryfall_id"],
+                   language=item["language"])
+        if new["finish"] not in FINISHES:
+            raise ValueError(f"finish must be one of {FINISHES}")
+        if new["condition"] not in CONDITIONS:
+            raise ValueError(f"condition must be one of {CONDITIONS}")
+        if card is not None:
+            new.update(scryfall_id=card["id"], card_name=card["name"], oracle_id=card.get("oracle_id"),
+                       set_code=card["set_code"].lower(), collector_number=str(card["collector_number"]),
+                       language=card.get("lang") or item["language"])
+        linked = [dict(r) for r in c.execute("SELECT * FROM deck_cards WHERE collection_item_id = ?", (item_id,))]
+        target = self._merge_target(c, item, new["collection_id"], new["scryfall_id"], new["finish"],
+                                    new["condition"], new["language"])
+        if target is None:
+            cols = [k for k in ("collection_id", "scryfall_id", "card_name", "oracle_id", "set_code",
+                                "collector_number", "finish", "condition", "language") if k in new]
+            sets = [f"{k} = ?" for k in cols]
+            args = [new[k] for k in cols]
+            if market_price is not self._UNSET:
+                sets += ["market_price = ?", f"price_updated_at = {NOW}"]
+                args.append(market_price)
+            c.execute(f"UPDATE collection_items SET {', '.join(sets)} WHERE id = ?", (*args, item_id))
+            lot = item_id
+        else:
+            lot = self._merge_into(c, item, target)
+            if market_price is not self._UNSET:
+                c.execute(f"UPDATE collection_items SET market_price = ?, price_updated_at = {NOW} WHERE id = ?",
+                          (market_price, lot))
+        # deck cards that described this physical copy now describe the corrected one
+        for dc in linked:
+            sets, args = [], []
+            if card is not None and dc["scryfall_id"] in (item["scryfall_id"], None):
+                sets += ["scryfall_id = ?", "card_name = ?", "oracle_id = ?"]
+                args += [new["scryfall_id"], new["card_name"], new["oracle_id"]]
+            dc_finish = dc["finish"]
+            if dc_finish in (item["finish"], None) or (finishes and dc_finish not in finishes):
+                if dc_finish != new["finish"]:
+                    sets.append("finish = ?")
+                    args.append(new["finish"])
+            if sets:
+                c.execute(f"UPDATE deck_cards SET {', '.join(sets)} WHERE id = ?", (*args, dc["id"]))
+        return lot
+
+    def change_printing(self, item_id, card, finish=None, market_price=_UNSET, finishes=None):
+        """Correct a lot to another exact printing (and/or finish). See _relocate."""
+        with self.transaction() as c:
+            return self._relocate(c, item_id, card=card, finish=finish, market_price=market_price,
+                                  finishes=finishes)
+
+    def change_finish(self, item_id, finish, market_price=_UNSET):
+        with self.transaction() as c:
+            return self._relocate(c, item_id, finish=finish, market_price=market_price)
 
     def move_items(self, item_ids, collection_id):
         """Move lots to another collection (merging with identical lots there)."""
@@ -868,6 +1024,66 @@ class UserDB:
         with self.transaction() as c:
             return c.execute(sql, args).lastrowid
 
+    # ---- "never suggest cutting" (analyser pins) ----------------------------------------
+
+    CARD_FLAGS = ("never_cut", "core", "not_important")
+
+    def set_card_flag(self, deck_id, card_name, flag, on=True):
+        """Per-deck feedback for the analyser: never_cut (never suggest cutting it), core (it's
+        what this deck is about - strong evidence for the strategy) or not_important (slightly
+        less protection; never a reason on its own to cut). core and not_important exclude
+        each other."""
+        if flag not in self.CARD_FLAGS:
+            raise ValueError(f"flag must be one of {self.CARD_FLAGS}")
+        with self.transaction() as c:
+            if on:
+                c.execute("INSERT OR IGNORE INTO deck_card_flags (deck_id, card_name, flag) VALUES (?, ?, ?)",
+                          (deck_id, card_name, flag))
+                other = {"core": "not_important", "not_important": "core"}.get(flag)
+                if other:
+                    c.execute("DELETE FROM deck_card_flags WHERE deck_id = ? AND card_name = ? AND flag = ?",
+                              (deck_id, card_name, other))
+            else:
+                c.execute("DELETE FROM deck_card_flags WHERE deck_id = ? AND card_name = ? AND flag = ?",
+                          (deck_id, card_name, flag))
+
+    def card_flags(self, deck_id):
+        """{card name: {flags}} for one deck."""
+        out = {}
+        for name, flag in self.conn.execute("SELECT card_name, flag FROM deck_card_flags WHERE deck_id = ?", (deck_id,)):
+            out.setdefault(name, set()).add(flag)
+        return out
+
+    # ---- feedback on suggested cards ------------------------------------------------------
+
+    SUGGESTION_VERDICTS = ("good", "not_for_deck")
+
+    def set_suggestion_feedback(self, deck_id, card_name, verdict):
+        """GOOD SUGGESTION ('good': a small nudge for similar cards - never adds anything) or
+        NOT FOR THIS DECK ('not_for_deck': never suggested for this deck again); None clears it."""
+        if verdict is not None and verdict not in self.SUGGESTION_VERDICTS:
+            raise ValueError(f"verdict must be one of {self.SUGGESTION_VERDICTS} or None")
+        with self.transaction() as c:
+            if verdict is None:
+                c.execute("DELETE FROM deck_suggestion_feedback WHERE deck_id = ? AND card_name = ?",
+                          (deck_id, card_name))
+            else:
+                c.execute("""INSERT INTO deck_suggestion_feedback (deck_id, card_name, verdict) VALUES (?, ?, ?)
+                             ON CONFLICT (deck_id, card_name) DO UPDATE SET verdict = excluded.verdict""",
+                          (deck_id, card_name, verdict))
+
+    def suggestion_feedback(self, deck_id):
+        """{card name: 'good' | 'not_for_deck'} for one deck."""
+        return {r[0]: r[1] for r in self.conn.execute(
+            "SELECT card_name, verdict FROM deck_suggestion_feedback WHERE deck_id = ?", (deck_id,))}
+
+    def protect_card(self, deck_id, card_name, protect=True):
+        """Pin a card so the analyser never suggests cutting it from this deck (or unpin it)."""
+        self.set_card_flag(deck_id, card_name, "never_cut", protect)
+
+    def protected_cards(self, deck_id):
+        return {n for n, f in self.card_flags(deck_id).items() if "never_cut" in f}
+
     def last_applied(self, deck_id):
         import json
         r = self.conn.execute("""SELECT * FROM applied_changes WHERE deck_id = ? AND undone_at IS NULL
@@ -927,11 +1143,14 @@ class UserDB:
                 card = card_lookup(e["id"])
                 if not card:
                     continue
-                price = {"foil": card.get("usd_foil"), "etched": card.get("usd_etched")}.get(e.get("finish")) or card.get("usd")
+                finish = e.get("finish") or "nonfoil"
+                # exactly this finish's price (a foil with no foil price has no price - not the non-foil one)
+                price = card.get({"nonfoil": "usd", "foil": "usd_foil", "etched": "usd_etched"}.get(finish, "usd"))
+                note = UNCONFIRMED_NOTE if e.get("printing_uncertain") else None
                 self.add_card(e["id"], card["name"], card["set_code"], card["collector_number"],
-                              finish=e.get("finish") or "nonfoil", collection_id=collection_id,
+                              finish=finish, collection_id=collection_id,
                               language=card.get("lang") or "en", oracle_id=card.get("oracle_id"),
-                              market_price=float(price) if price else None, _conn=c)
+                              market_price=float(price) if price else None, notes=note, _conn=c)
                 added += 1
                 done.append(e)
             if added:

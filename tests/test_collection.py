@@ -261,10 +261,10 @@ class CollectionManagementTests(Base):
             self.db.delete_collection(main)
         with self.assertRaises(UserDBError):
             self.db.delete_collection(main, "delete")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(UserDBError):  # blank names are refused with a clear message
             self.db.rename_collection(box, "   ")
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.db.rename_collection(box, "everything")  # names are unique
+        with self.assertRaises(UserDBError):  # names are unique (clear message, not a database error)
+            self.db.rename_collection(box, "everything")
 
     def test_delete_collection_with_cards_requires_a_choice(self):
         main = self.db.default_collection_id()
